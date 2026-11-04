@@ -16,7 +16,7 @@
 
 class Camera;
 class SimulationGrid;
-struct FluxSurface;
+struct SourceDesc;
 
 struct RenderSettings {
     enum class Mode : int { Fields = 0, EOnly = 1, BOnly = 2, Poynting = 3, SignedE = 4, Count = 5 };
@@ -54,9 +54,11 @@ public:
     // Additively blended overlay lines in world space.
     void drawLines(const Camera& camera, const std::vector<LineVertex>& lines);
 
-    // Builds the standard overlay for the given grid / probe / flux surface.
-    static void buildOverlay(std::vector<LineVertex>& out, const glm::ivec3& gridSize, int pmlThickness,
-                             const glm::vec3& probe, const FluxSurface& flux);
+    // Grid bounds and absorbing-layer boundary (clears `out` first).
+    static void buildGridOverlay(std::vector<LineVertex>& out, const glm::ivec3& gridSize, int pmlThickness);
+    // Source footprints: points as crosses, wires as segments, sheets as rectangles.
+    static void appendSources(std::vector<LineVertex>& out, const glm::ivec3& gridSize,
+                              const std::vector<SourceDesc>& sources);
 
     // --- lattice <-> world mapping ------------------------------------------
     static float worldScale(const glm::ivec3& gridSize);

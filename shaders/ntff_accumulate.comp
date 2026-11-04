@@ -1,0 +1,52 @@
+#version 460 core
+// =============================================================================
+// ntff_accumulate.comp - running single-frequency DFT of E and H on the Huygens box.
+//
+// For a time-harmonic field F(t) = Re{ A e^{i w t} }, the product
+//     2 F(t) e^{-i w t} = A + conj(A) e^{-2 i w t}
+// averages to the complex amplitude A. Two cascaded exponential moving averages
+// (time constant tau/2 each) remove the 2w term: a single stage would leave a
+// ~1/(2 w tau) ~ 2% ripple that biases the directivity; the cascade leaves
+// ~1/(w tau)^2 ~ 0.2%. The filter converges after the start-up transient and
+// keeps tracking when the sources change (live beam steering). E is sampled at t_E = n dt and B at t_H = (n - 1/2) dt; the
+// rotation factors for both instants come from the CPU in double precision.
+// =============================================================================
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler3D uEField;
+layout(binding = 1) uniform sampler3D uBField;
+uniform ivec3 uGridSize;
+
+#include "field_sampling.glsl"
+#include "ntff_common.glsl"
+
+layout(std430, binding = 3) restrict buffer PhasorBuffer { PhasorPair uPhasors[]; };
+
+uniform int   uPointCount;
+uniform vec4  uRotation; // (cos w t_E, sin w t_E, cos w t_H, sin w t_H)
+uniform float uBlend;    // per-stage EMA weight per step: 1 - exp(-dt / (tau / 2))
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= uPointCount) return;
+
+    ivec3 node;
+    vec3 normal;
+    float weight;
+    ntffPoint(i, node, normal, weight);
+
+    vec3 E = eAtNode(node);
+    vec3 H = bAtNode(node);
+
+    PhasorPair p = uPhasors[i];
+    p.stage1.eRe.xyz += uBlend * ( 2.0 * uRotation.x * E - p.stage1.eRe.xyz);
+    p.stage1.eIm.xyz += uBlend * (-2.0 * uRotation.y * E - p.stage1.eIm.xyz);
+    p.stage1.hRe.xyz += uBlend * ( 2.0 * uRotation.z * H - p.stage1.hRe.xyz);
+    p.stage1.hIm.xyz += uBlend * (-2.0 * uRotation.w * H - p.stage1.hIm.xyz);
+    p.stage2.eRe.xyz += uBlend * (p.stage1.eRe.xyz - p.stage2.eRe.xyz);
+    p.stage2.eIm.xyz += uBlend * (p.stage1.eIm.xyz - p.stage2.eIm.xyz);
+    p.stage2.hRe.xyz += uBlend * (p.stage1.hRe.xyz - p.stage2.hRe.xyz);
+    p.stage2.hIm.xyz += uBlend * (p.stage1.hIm.xyz - p.stage2.hIm.xyz);
+    uPhasors[i] = p;
+}

@@ -68,13 +68,6 @@ public:
     // Box surfaces return the net outward power.
     [[nodiscard]] double measureFlux(const SimulationGrid& grid, const FluxSurface& surface) const;
 
-    // Measures and folds the sample into a running time average.
-    // `averagingTime` is the EMA time constant in simulation time units.
-    const FluxReading& updateFlux(const SimulationGrid& grid, const FluxSurface& surface,
-                                  double averagingTime);
-    void resetFluxHistory();
-    [[nodiscard]] const FluxReading& fluxReading() const noexcept { return m_reading; }
-
 private:
     double planeFlux(const SimulationGrid& grid, int axis, int index, glm::ivec2 rectMin,
                      glm::ivec2 rectMax) const;
@@ -82,8 +75,5 @@ private:
     Shader m_fluxShader;
     gl::Buffer m_partials;
     mutable size_t m_partialCapacity = 0; // partial-sum buffer capacity (floats)
-
-    FluxReading m_reading{};
-    double m_lastTime = -1.0;
     mutable std::vector<float> m_partialScratch;
 };

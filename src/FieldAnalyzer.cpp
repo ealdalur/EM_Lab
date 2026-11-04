@@ -167,27 +167,3 @@ double FieldAnalyzer::measureFlux(const SimulationGrid& grid, const FluxSurface&
     }
     return total;
 }
-
-const FluxReading& FieldAnalyzer::updateFlux(const SimulationGrid& grid, const FluxSurface& surface,
-                                             double averagingTime) {
-    const double t = grid.time();
-    const double p = measureFlux(grid, surface);
-
-    if (m_lastTime < 0.0 || t < m_lastTime) { // first sample or the simulation was reset
-        m_reading = {};
-        m_reading.timeAveraged = p;
-    } else {
-        const double dtSample = t - m_lastTime;
-        const double a = averagingTime > 0.0 ? 1.0 - std::exp(-dtSample / averagingTime) : 1.0;
-        m_reading.timeAveraged += a * (p - m_reading.timeAveraged);
-    }
-    m_reading.instantaneous = p;
-    m_reading.peakAbs = std::max(m_reading.peakAbs, std::abs(p));
-    m_lastTime = t;
-    return m_reading;
-}
-
-void FieldAnalyzer::resetFluxHistory() {
-    m_reading = {};
-    m_lastTime = -1.0;
-}

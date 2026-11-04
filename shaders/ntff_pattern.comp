@@ -1,0 +1,89 @@
+#version 460 core
+// =============================================================================
+// ntff_pattern.comp - far-field radiation integrals, one workgroup per direction.
+//
+// Equivalent surface currents on the Huygens box (outward normal n):
+//     J = n x H,   M = -n x E
+// Radiation vectors for the observation direction r:
+//     N = sum J e^{i k r.r'} dA,   L = sum M e^{i k r.r'} dA
+// Far field (eta = 1):  E_far ~ -i k e^{-ikr}/(4 pi r) * (eta N_perp - r x L), so the
+// radiation intensity is U = k^2 / (32 pi^2) * |N_perp - r x L|^2.
+//
+// Every workgroup also accumulates the radiated power through the box,
+//     P = 1/2 sum Re{ (E x H*) . n } dA,
+// which keeps control flow uniform (no divergent barriers). Output per direction:
+//     uOut[2 g] = |N_perp - r x L|^2,   uOut[2 g + 1] = P.
+// =============================================================================
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "ntff_common.glsl"
+
+layout(std430, binding = 3) readonly restrict buffer PhasorBuffer { PhasorPair uPhasors[]; };
+layout(std430, binding = 4) readonly restrict buffer DirectionBuffer { vec4 uDirections[]; };
+layout(std430, binding = 5) writeonly restrict buffer OutputBuffer { float uOut[]; };
+
+uniform int  uPointCount;
+uniform float uK;       // vacuum wavenumber (rad / cell)
+uniform vec3 uCenter;   // phase reference (box centre, lattice units)
+
+shared vec3  sNr[256];
+shared vec3  sNi[256];
+shared vec3  sLr[256];
+shared vec3  sLi[256];
+shared float sP[256];
+
+void main() {
+    uint g   = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationIndex;
+    vec3 r   = uDirections[g].xyz;
+
+    vec3 Nr = vec3(0.0), Ni = vec3(0.0), Lr = vec3(0.0), Li = vec3(0.0);
+    float P = 0.0;
+
+    for (int i = int(lid); i < uPointCount; i += 256) {
+        ivec3 node;
+        vec3 n;
+        float w; // trapezoid area weight dA
+        ntffPoint(i, node, n, w);
+        Phasor ph = uPhasors[i].stage2;
+
+        vec3 Jr =  w * cross(n, ph.hRe.xyz), Ji =  w * cross(n, ph.hIm.xyz);
+        vec3 Mr = -w * cross(n, ph.eRe.xyz), Mi = -w * cross(n, ph.eIm.xyz);
+
+        float psi = uK * dot(r, vec3(node) - uCenter);
+        float c = cos(psi), s = sin(psi);
+        Nr += Jr * c - Ji * s;
+        Ni += Jr * s + Ji * c;
+        Lr += Mr * c - Mi * s;
+        Li += Mr * s + Mi * c;
+
+        P += w * dot(cross(ph.eRe.xyz, ph.hRe.xyz) + cross(ph.eIm.xyz, ph.hIm.xyz), n);
+    }
+
+    sNr[lid] = Nr; sNi[lid] = Ni; sLr[lid] = Lr; sLi[lid] = Li; sP[lid] = P;
+    memoryBarrierShared();
+    barrier();
+
+#define REDUCE_STEP(STRIDE)                                      \
+    if (lid < STRIDE##u) {                                       \
+        sNr[lid] += sNr[lid + STRIDE##u];                        \
+        sNi[lid] += sNi[lid + STRIDE##u];                        \
+        sLr[lid] += sLr[lid + STRIDE##u];                        \
+        sLi[lid] += sLi[lid + STRIDE##u];                        \
+        sP[lid]  += sP[lid + STRIDE##u];                         \
+    }                                                            \
+    memoryBarrierShared();                                       \
+    barrier();
+    REDUCE_STEP(128) REDUCE_STEP(64) REDUCE_STEP(32) REDUCE_STEP(16)
+    REDUCE_STEP(8)   REDUCE_STEP(4)  REDUCE_STEP(2)  REDUCE_STEP(1)
+#undef REDUCE_STEP
+
+    if (lid == 0u) {
+        vec3 nr = sNr[0], ni = sNi[0];
+        vec3 Fr = (nr - dot(nr, r) * r) - cross(r, sLr[0]);
+        vec3 Fi = (ni - dot(ni, r) * r) - cross(r, sLi[0]);
+        uOut[2u * g]      = dot(Fr, Fr) + dot(Fi, Fi);
+        uOut[2u * g + 1u] = 0.5 * sP[0];
+    }
+}

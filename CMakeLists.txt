@@ -20,6 +20,7 @@ endif()
 find_package(SDL3 CONFIG REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(glm CONFIG REQUIRED)
+find_package(Lua 5.4 REQUIRED)   # scene scripting (Lua 5.4 or newer)
 
 # GLAD: OpenGL 4.6 Core loader (generated with glad 0.1.36, vendored in external/glad)
 add_library(glad STATIC external/glad/src/glad.c)
@@ -38,6 +39,9 @@ set(EMLAB_SOURCES
   src/Environment.cpp
   src/FieldAnalyzer.cpp
   src/GpuSelection.cpp
+  src/FarField.cpp
+  src/Instruments.cpp
+  src/ScriptEngine.cpp
 )
 
 set(EMLAB_HEADERS
@@ -49,6 +53,9 @@ set(EMLAB_HEADERS
   src/Environment.hpp
   src/FieldAnalyzer.hpp
   src/GpuSelection.hpp
+  src/FarField.hpp
+  src/Instruments.hpp
+  src/ScriptEngine.hpp
 )
 
 set(EMLAB_SHADERS
@@ -57,22 +64,31 @@ set(EMLAB_SHADERS
   shaders/update_B.comp
   shaders/clear_fields.comp
   shaders/poynting_flux.comp
+  shaders/field_sampling.glsl
+  shaders/ntff_common.glsl
+  shaders/ntff_accumulate.comp
+  shaders/ntff_pattern.comp
   shaders/fullscreen.vert
   shaders/raymarch.frag
   shaders/lines.vert
   shaders/lines.frag
 )
 
-add_executable(${PROJECT_NAME} ${EMLAB_SOURCES} ${EMLAB_HEADERS} ${EMLAB_SHADERS})
-source_group("Shaders" FILES ${EMLAB_SHADERS})
+file(GLOB EMLAB_SCENES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/scenes/*.lua)
 
-target_include_directories(${PROJECT_NAME} PRIVATE src)
+
+add_executable(${PROJECT_NAME} ${EMLAB_SOURCES} ${EMLAB_HEADERS} ${EMLAB_SHADERS} ${EMLAB_SCENES})
+source_group("Shaders" FILES ${EMLAB_SHADERS})
+source_group("Scenes" FILES ${EMLAB_SCENES})
+
+target_include_directories(${PROJECT_NAME} PRIVATE src ${LUA_INCLUDE_DIR})
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
   glad
   SDL3::SDL3
   OpenGL::GL
   glm::glm
+  ${LUA_LIBRARIES}
 )
 
 if(WIN32)
@@ -85,6 +101,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
   GLM_FORCE_RADIANS
   # Fallback shader location so the executable also runs straight from the build tree / IDE.
   EMLAB_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+  EMLAB_SCENE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/scenes"
 )
 
 if(MSVC)
@@ -105,9 +122,13 @@ else()
   )
 endif()
 
-# Ship the shaders next to the executable (the app searches <exe>/shaders first).
+# Ship shaders and scene scripts next to the executable (searched there first,
+# then in the source tree, so edits to scenes/*.lua hot-reload when run from an IDE).
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           ${CMAKE_CURRENT_SOURCE_DIR}/shaders
           $<TARGET_FILE_DIR:${PROJECT_NAME}>/shaders
-  COMMENT "Copying GLSL shaders to output directory")
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          ${CMAKE_CURRENT_SOURCE_DIR}/scenes
+          $<TARGET_FILE_DIR:${PROJECT_NAME}>/scenes
+  COMMENT "Copying shaders and scene scripts to output directory")

@@ -1,105 +1,177 @@
 # EM_Lab — GPU FDTD Electromagnetic Wave Simulator
 
-A real-time 3D Maxwell solver (FDTD on a Yee lattice) that runs entirely in OpenGL 4.6 compute shaders and is visualised with a volumetric raymarcher. Built with C++17, SDL3, GLAD and GLM.
+A real-time 3D Maxwell solver (FDTD on a Yee lattice) that runs entirely in OpenGL 4.6 compute shaders and is visualised with a volumetric raymarcher. Scenes are **Lua scripts**, so you can build your own experiments on wave propagation, antennas and how materials affect fields. Built with C++17, SDL3, GLAD, GLM and Lua.
 
 ## Build
 
-Requirements: CMake ≥ 3.20, a C++17 compiler, a GPU/driver with OpenGL 4.6 Core, and the vcpkg packages `sdl3` and `glm`.
+Requirements: CMake ≥ 3.20, a C++17 compiler, a GPU/driver with OpenGL 4.6 Core, and the vcpkg packages `sdl3`, `glm` and `lua` (Lua 5.4 or newer).
 
 ```sh
+vcpkg install sdl3 glm lua
 cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
-build/Release/EM_Lab.exe --scene 1
+build/Release/EM_Lab.exe              # first bundled scene
+build/Release/EM_Lab.exe --script my_scene.lua
 ```
 
-Shaders are copied next to the executable after each build. If they aren't found there, the app falls back to `<source>/shaders`.
+Shaders and scenes are copied next to the executable after each build. When the source tree is available, the app loads scenes from `<source>/scenes`, so edits to the bundled scripts hot-reload.
 
 **GPU selection.** On hybrid laptops the app runs on the discrete GPU by default and falls back to the integrated GPU when there isn't one. On Windows, the executable exports `NvOptimusEnablement` and `AmdPowerXpressRequestHighPerformance`, which tell the NVIDIA and AMD drivers to use the discrete GPU. On Linux, it sets the PRIME render-offload variables, but only if you haven't set them yourself. At startup the console lists the hardware adapters and the one OpenGL is running on. It warns if a per-app setting in Windows Graphics Settings or the NVIDIA Control Panel has forced a different GPU, because those settings override the driver hints. See [src/GpuSelection.cpp](src/GpuSelection.cpp).
 
-Command-line options: `--scene 1-5`, `--steps N` (steps per frame), `--novsync`, `--gldebug`, `--width/--height`. For scripted runs: `--frames N` exits after N frames, `--keys "3...."` replays key presses at startup, and `--screenshot out.bmp` saves the last frame. The exit code is 2 if any non-finite field value is detected.
+**Command line**
 
-## Scenes and controls
+| Option | Purpose |
+|---|---|
+| `--script FILE.lua` | load a scene script |
+| `--scene N` | load the N-th bundled scene |
+| `--list` | list the bundled scenes |
+| `--set NAME=VALUE` | override a script parameter (repeatable) |
+| `--steps N` | simulation steps per frame |
+| `--novsync`, `--gldebug`, `--width W`, `--height H` | display and debugging |
+| `--frames N` | run N frames, then exit |
+| `--keys "..."` | replay key presses at startup |
+| `--screenshot out.bmp` | save the last frame of a `--frames` run |
 
-| Key | Scene | What to look for |
-|---|---|---|
-| 1 | Double slit | Plane wave (J_y sheet), σ = 100 wall with two slits; interference fringes behind the wall |
-| 2 | Faraday cage | Plane wave on a metal mesh cage (pitch λ/9). **G** toggles the cage: interior power drops by about 40 dB |
-| 3 | Phased antenna array | 8 half-wave dipoles, λ/2 spacing. **, / .** change the phase step by ±15° to steer the beam (sin θ = −Δφ / kd) |
-| 4 | Oscillating dipole | J_z = J₀ sin ωt. The closed flux box measures total radiated power. **T** switches between CW and pulsed |
-| 5 | Dielectric ball lens | ε_r = 2.5 sphere that focuses a plane wave. The probe sits at the paraxial focus |
+Exit codes (for `--frames` runs): 2 means non-finite fields were detected, 3 means the scene script failed to load. In interactive use, a failing script never exits the app; the error is printed and the previous scene keeps running.
+
+## Scripted scenes
+
+```lua
+scene { name = "Dipole and glass sphere", size = {128, 128, 128}, wavelength = 16 }
+
+local d = param { name = "distance", default = 30, min = 15, max = 45, step = 5, keys = {",", "."} }
+
+dipole    { center = grid.center, orientation = "z", amplitude = 7 }
+sphere    { center = grid.center + vec(d, 0, 0), radius = 10, material = "glass" }
+probe     { position = grid.center + vec(-30, 0, 0), name = "behind" }
+flux_box  { center = grid.center, size = 24, name = "radiated" }
+far_field {}
+```
+
+**Building blocks**
+
+| Category | Primitives |
+|---|---|
+| Geometry | `box`, `sphere` / ellipsoid, `cylinder` / tube, `wall` with slits and apertures, `grating`, `cage`, `frame`, and procedural `shape{ inside = function(x, y, z) ... end }`. Shapes can be rotated and hollowed. |
+| Materials | 30 built-in (metals, PEC, dielectrics, building materials, water, ground) plus custom ones defined by ε_r with σ, conductivity in S/m, or loss tangent |
+| Sources | `plane_wave` (one-way or two-way), `gaussian_beam`, `dipole` (point or wire), `loop`, phased `array` (1-D or 2-D, with steering and tapers), and generic `current_source`. Waveforms: CW or pulses. |
+| Instruments | `probe`, `flux_plane`, `flux_box`, and `far_field` (radiation pattern, directivity in dBi, beamwidth, front/back), each with optional CSV logging |
+| Interactivity | `param{}` binds keys to values. The script is re-run when a key is pressed, keeping the fields when only sources changed. Saving the file hot-reloads it. |
+
+The full reference, covering units, every key, the material table, accuracy guidelines and limitations, is in **[docs/SCRIPTING.md](docs/SCRIPTING.md)**.
+
+**Bundled scenes** (in [scenes/](scenes/); keys 1–9 and 0, F6/F7 to step through):
+
+| # | Scene | Parameters | What it shows |
+|---|---|---|---|
+| 1 | Double slit | slit width `, .`; separation `; '` | Interference fringes; spacing ∝ λ/d |
+| 2 | Faraday cage | cage `G`; mesh pitch `, .` | −56 dB interior field; shielding collapses as the openings approach λ/2 |
+| 3 | Phased array | steer `, .`; elements `; '`; taper `T` | Beam steering, beamwidth ∝ 1/N, sidelobe tapers |
+| 4 | Oscillating dipole | CW / pulse `T` | Doughnut pattern: 1.87 dBi measured at 16 cells/λ (theory 1.76 dBi); radiated power |
+| 5 | Ball lens | ε_r `, .` | Focusing; the probe tracks the paraxial focus |
+| 6 | Yagi-Uda | directors `, .` | 11 dBi, 19 dB front/back from parasitic elements |
+| 7 | Pyramidal horn | flare length `, .` | Procedural geometry; 16.5 dBi |
+| 8 | Wire-grid polarizer | polarization `X`; grid `G` | E ∥ wires −24 dB, E ⊥ wires passes |
+| 9 | Dipole over ground | height `, .`; ground material `G` | Two-ray interference lobes |
+| 10 | Prism | ε_r `, .` | Total internal reflection above ε_r = 2 |
+| 11 | Planar array + reflector | azimuth `, .`; elevation `; '`; ground `G` | 2-D steering, 18.6 dBi, 43 dB front/back |
+
+## Controls
+
+**Scenes**
+- **1–9, 0** load a bundled scene; **F6 / F7** step to the previous or next one.
+- Drag and drop a `.lua` file onto the window to open it. **F5** reloads the current script (saving also reloads it).
 
 **Camera**
 - LMB drag orbits, RMB/MMB drag pans, the wheel zooms.
-- **C** switches to fly mode (WASD to move, Q/E for down/up, Shift to go faster).
+- **C** switches to fly mode: WASD to move, Q/E down and up, Shift for speed.
 
 **Simulation**
 - **Space** pauses and resumes; **N** advances one step while paused; **R** resets the fields.
 - **[ / ]** change the number of steps per frame.
 
 **View**
-- **M** cycles render modes: E+B, \|E\|, \|B\|, Poynting \|E×B\|, and signed E (crests vs. troughs). **V** picks which E component the signed mode shows.
-- **− / +** adjust visual gain.
-- **K / L** move the z cutaway.
-- **O** toggles the overlay; **H** toggles half-resolution rendering.
-- **F3 / F4** change the ray step size.
+- **M** cycles render modes: E+B, \|E\|, \|B\|, Poynting, and signed E. **V** picks the component for signed mode.
+- **− / +** adjust visual gain; **K / L** move the z cutaway.
+- **O** toggles the overlay; **H** toggles half-resolution rendering; **F3 / F4** change the ray step.
 
-**Measurement and output**
-- Arrow keys and PgUp/PgDn move the probe (hold Shift for ×5).
-- **P** prints a probe and flux report; **F12** saves a screenshot.
+**Measurement**
+- **Tab** selects a probe; the arrows and PgUp/PgDn move it (Shift for ×5).
+- **P** prints the full measurement report; **F12** saves a screenshot.
 
-Live readings are shown in the window title, and a report is printed to the console every 2 s.
+Script parameters use the keys listed under "Parameters" in the console.
+
+**Overlay**
+
+| Colour | Shows |
+|---|---|
+| Light grey box | grid bounds |
+| Faint blue box | absorbing layer |
+| Orange | sources |
+| Yellow crosses | probes (the selected one is brighter) |
+| Green | flux monitors |
+| Purple box | far-field box |
+| Orange / cyan / green polar curves | xy / xz / yz radiation-pattern cuts, on a 30 dB scale |
 
 ## Architecture
 
 ```
 src/
-  Main.cpp            SDL3 lifecycle, input, simulate -> measure -> render loop, HUD, GPU timers
-  Camera.*            Z-up orbit / fly camera (shared yaw/pitch, pitch clamped to avoid lookAt singularity)
-  Shader.*            Graphics + compute programs, recursive #include, uniform cache, dispatch helper
-  SimulationGrid.*    Yee textures, solver params, source SSBOs, leapfrog dispatches, field reset
-  Environment.*       Shape voxeliser + fluent EnvironmentBuilder + the five scene presets
-  FieldAnalyzer.*     Virtual E/B/S probe (staggering-aware), GPU Poynting flux through planes/boxes
+  Main.cpp            SDL3 lifecycle, input, scene loading / hot reload / params, simulate -> measure -> render loop
+  ScriptEngine.*      Sandboxed Lua runtime and scene API (validation, typo hints, units, material library)
+  Environment.*       Scene description, composable shapes (transform / difference / lambda / wall), voxeliser
+  SimulationGrid.*    Yee textures, edge-averaged material texture, source SSBOs, leapfrog dispatches
+  Instruments.*       Probes, flux monitors, far-field monitor: averaging, CSV logs, reports, overlay
+  FarField.*          GPU near-to-far-field transform: running DFT on a Huygens box, pattern and directivity
+  FieldAnalyzer.*     Staggering-aware probe readback, GPU Poynting flux through planes / boxes
   VolumeRenderer.*    Full-screen raymarch pass, optional reduced-resolution target, line overlay
-  GLUtils.hpp         RAII GL handles, debug-output callback
+  Camera.*, Shader.*, GLUtils.hpp, GpuSelection.*
 shaders/
   common.glsl         Units, Yee layout, graded absorber profile, stable exponential coefficients
   update_B.comp       Faraday step   (reads E as sampler, updates B in place)
   update_E.comp       Ampère step + conduction + analytic current injection
-  clear_fields.comp   Zero fields, keep materials
+  field_sampling.glsl E / B co-located at lattice nodes (shared by flux and NTFF)
   poynting_flux.comp  Shared-memory reduction of (E×B)·n over a rectangle
-  fullscreen.vert / raymarch.frag / lines.*
+  ntff_*.comp/.glsl   Far-field: phasor accumulation and radiation integrals
+  clear_fields.comp, fullscreen.vert, raymarch.frag, lines.*
+scenes/               Bundled Lua scenes
+docs/SCRIPTING.md     Scripting reference
 external/glad         GLAD 0.1.36 loader, OpenGL 4.6 Core (generated)
 ```
 
 ### Physics notes
 
-- **Units.** c = ε₀ = μ₀ = 1 and one cell is one length unit, so dt equals the Courant number S (0.5, below the 3D limit of 1/√3). The B texture stores c·B, which means the Poynting vector is simply S = E × B.
-- **Memory layout.** `E_Field_Tex` RGBA32F holds (Ex, Ey, Ez, σ). `B_Field_Tex` RGBA32F holds (Bx, By, Bz, ε_r). The staggered positions are documented in `common.glsl`. Each pass reads and writes only its own texel of the field it updates, so the update runs in place with no ping-pong buffers.
-- **Lossy media.** The conduction term uses an exponential time integrator: E ← e^(−x)·E + (dt/ε)·φ(x)·(∇×B − J), where x = σ·dt/ε and φ(x) = (1 − e^(−x))/x is evaluated with a series for small x. It is unconditionally stable. Unlike the textbook Crank–Nicolson coefficients, it never gives a negative decay factor (those ring at σ = 100).
-- **Absorbing boundary.** The outer 16 cells carry an exponentially graded conductivity σ(u) = σ_max·(e^(gu) − 1)/(e^g − 1). A matched magnetic loss σ_m = σ is applied in the B update, so the layer's impedance equals free space. Normal-incidence reflection is about 10⁻⁶.
-- **Sources.** Each source is J = p·A·w(x)·s(t). The footprint w(x) is a soft box or Gaussian evaluated at each staggered E position, which covers points, line dipoles, and infinite current sheets. The time signal s(t) is evaluated per source on the CPU in double precision for every sub-step, so the phase doesn't drift during long runs. CW sources ramp up with a C² smootherstep to keep DC charge build-up negligible.
+- **Units.** c = ε₀ = μ₀ = 1 and one cell is one length unit, so dt equals the Courant number S (0.5, below the 3D limit of 1/√3). The B texture stores c·B, so the Poynting vector is simply S = E × B. A script's `cell_size` maps all of this onto SI units.
+- **Memory layout.** `E_Field_Tex` RGBA32F holds (Ex, Ey, Ez, σ) and `B_Field_Tex` RGBA32F holds (Bx, By, Bz, ε_r), with σ and ε_r per cell; the staggered positions are documented in `common.glsl`. A third texture holds the edge-averaged materials, so GPU memory is 48 bytes per cell. Each pass updates its own field in place.
+- **Edge-averaged materials.** Each E component sits on a Yee edge shared by four cells. The solver uses those cells' average σ and ε_r, precomputed into a packed half-float texture. This zeros tangential E on every face of a metal object, so staircased PEC is symmetric and thin rods behave like proper wires. It also gives the standard averaged permittivity at dielectric interfaces.
+- **Lossy media.** An exponential time integrator, E ← e^(−x)·E + (dt/ε)·φ(x)·(∇×B − J) with x = σ·dt/ε, is unconditionally stable for any conductivity. Unlike Crank–Nicolson, it has no sign-flip ringing in metals. Edge conductivities are stored as half floats and clamped at 6×10⁴ (normalized), which is already a perfect conductor (field decay factor e^(−30000) per step).
+- **Absorbing boundary.** Exponentially graded conductivity with a matched magnetic loss, so the layer's impedance equals free space. Normal-incidence reflection is about 10⁻⁶.
+- **Sources.** J = p·A·w(x)·s(t). The footprint w(x) is a soft box with per-axis Gaussian edges, covering points, wires, sheets and beams. The signal s(t) is evaluated in double precision on the CPU for each sub-step. One-way plane waves use two sheets λ/4 apart, the second delayed by T/4.
+- **Far field.** A running single-frequency DFT of E and H on a closed Huygens box (two cascaded averages, about 0.2% ripple), trapezoid-weighted surface integration, and radiation integrals evaluated on the GPU in one workgroup per direction. D = 4πU / P_rad, with P_rad taken from the same surface.
 
 ### Validation (measured with this code)
 
-- Dipole radiated power: the closed-box flux reads 0.3665, against the analytic Hertzian value of 0.367 for the discretised current moment.
-- Faraday cage: interior |E| goes from 0.68 to 0.016, and interior power from 229 to 0.015 (−42 dB).
-- Phased array: broadside power is 0.46 at Δφ = 0°, 0.26 at 90°, and 0.035 at 180° (the predicted broadside null).
+| Test | Result | Reference |
+|---|---|---|
+| Hertzian dipole directivity | 1.87 dBi at 16 cells/λ, 1.78 dBi at 32 cells/λ | 1.76 dBi (second-order convergence) |
+| Hertzian dipole HPBW | 87.5° / 89.4° | 90° |
+| Dipole radiated power (closed flux box) | 0.359 | 0.360 analytic for the discretised current |
+| 8-element λ/2 array beamwidth | 12.6° | 12.7° |
+| 4×4 planar array over a reflector | 18.6 dBi | 18.5 dBi (4πA/λ²) |
+| Faraday cage (pitch λ/9) | interior \|E\| −56 dB, power −76 dB | — |
+| Wire grid, period λ/6 | E ∥ −24 dB, E ⊥ −0.1 dB | — |
+| Right-angle prism | 87% TIR at n = 1.5; 81% transmitted at n = 1.22 | TIR threshold n = √2 |
 
-## Extending
+## Using the C++ API directly
+
+Scripts drive `EnvironmentBuilder` (see [src/Environment.hpp](src/Environment.hpp)), which you can also call from C++:
 
 ```cpp
 EnvironmentBuilder b("My scene", GridConfig{{160, 128, 128}});
-b.box({60, 0, 0}, {62, 128, 128}, Material::metal())          // wall
- .cylinder({61, 64, 64}, 0, 8.0f, 2.0f, Material::vacuum())    // circular aperture
- .sphere({100, 64, 64}, 12.0f, Material::dielectric(4.0f))
- .fill(LambdaShape({{0,0,0},{160,128,128}}, [](const glm::vec3& p) { return p.y > 100 && p.z < 20; }),
-       Material::absorber(0.5f))
- .voxels([](const glm::ivec3& c) -> std::optional<Material> { return std::nullopt; }) // procedural
- .source(SourceDesc::planeWave(0, 24.0f, {0, 0, 1}, 16.0f, 2.0f))
- .probe({120, 64, 64})
- .flux(FluxSurface::box({110, 54, 54}, {130, 74, 74}, "detector"));
-Environment env = b.build();
-grid.configure(env.grid); grid.uploadMaterials(env.materials); grid.setSources(env.sources);
+b.box({60, 0, 0}, {62, 128, 128}, Material::metal());
+b.fill(TransformedShape(std::make_shared<BoxShape>(glm::vec3(-10), glm::vec3(10)), {100, 64, 64},
+                        rotationFromEulerDegrees({0, 0, 30})), Material::dielectric(4.0f));
+Environment& env = b.env();
+env.sources.push_back(SourceDesc::planeWave(0, 24.0f, {0, 0, 1}, 16.0f, 0.5f));
+env.probes.push_back({"detector", {120, 64, 64}, ""});
 ```
-
-For custom geometry, subclass `Shape` (implement `contains` and `bounds`) and pass it to `fill`.

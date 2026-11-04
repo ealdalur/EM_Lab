@@ -50,6 +50,9 @@ vcpkg_installed/
 # Screenshots written by the app (F12 / --screenshot)
 em_lab_*.bmp
 
+# Measurement logs (default: <script folder>/output/<script name>/)
+output/
+
 # OS clutter
 Thumbs.db
 desktop.ini

@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <vector>
 
 // -----------------------------------------------------------------------------
@@ -76,25 +77,36 @@ enum class Waveform : int {
 };
 
 struct SourceDesc {
+    static constexpr float kDipoleSoftness = 0.75f; // transverse Gaussian radius of wire currents
+    static constexpr float kSheetSoftness = 1.0f;   // sheet thickness: sampled sum is offset-invariant
+
     glm::vec3 center{0.0f};      // cell coordinates
     glm::vec3 halfExtent{0.0f};  // flat-top region (0 = point); large = sheet / plane wave
-    float softness = 0.75f;      // Gaussian edge width (cells), clamped >= 0.25
+    glm::vec3 softness{kDipoleSoftness}; // per-axis Gaussian edge width (cells), clamped >= 0.25
     glm::vec3 polarization{0.0f, 0.0f, 1.0f};
-    float amplitude = 1.0f;      // J0
+    float amplitude = 1.0f;      // raw current density J0 (see the factories for physical inputs)
     float wavelength = 16.0f;    // vacuum wavelength in cells (omega = 2 pi c / lambda)
     float phase = 0.0f;          // radians
     Waveform waveform = Waveform::ContinuousWave;
     float rampPeriods = 3.0f;    // CW: smooth turn-on duration; pulse: 1/e half-width tau
     float repeatPeriods = 0.0f;  // pulse repetition interval (0 = single shot)
+    float delayPeriods = 0.0f;   // start delay
     bool enabled = true;
 
-    // Point-like oscillating dipole (an "oscillating electron") or, with length > 0,
-    // a linear antenna element along `axis`.
+    // Wire current along `axis` carrying peak current `current` (total current through the
+    // cross-section). length = 0 gives a point (Hertzian) dipole, an "oscillating electron".
     static SourceDesc dipole(const glm::vec3& center, const glm::vec3& axis, float wavelength,
-                             float amplitude, float length = 0.0f);
-    // Infinite current sheet normal to `normalAxis` at `position` -> plane wave.
+                             float current, float length = 0.0f);
+    // Infinite current sheet normal to `normalAxis` at `position` radiating a plane wave
+    // of E-field amplitude `fieldAmplitude` to each side.
     static SourceDesc planeWave(int normalAxis, float position, const glm::vec3& polarization,
-                                float wavelength, float amplitude);
+                                float wavelength, float fieldAmplitude);
+
+    // Sheet current density J0 (Gaussian thickness `softness`) whose radiated plane wave has
+    // amplitude E0 on each side:  E0 = J0 * softness * sqrt(pi) * exp(-(k softness)^2 / 4) / 2.
+    static float sheetCurrentForField(float fieldAmplitude, float wavelength, float softness);
+    // Current density J0 such that a wire of Gaussian radius `softness` carries `current`.
+    static float wireCurrentDensity(float current, float softness);
 
     [[nodiscard]] double omega() const noexcept;
     // Temporal signal s(t) in double precision (t in normalised time units).
@@ -126,7 +138,9 @@ public:
     void resetFields();
 
     // Advance `count` leapfrog steps (B half step then E full step each).
-    void step(int count);
+    // `afterEachStep` (optional) runs after every completed step, e.g. for monitors
+    // that must sample every time step (far-field DFT accumulation).
+    void step(int count, const std::function<void()>& afterEachStep = {});
 
     [[nodiscard]] GLuint eFieldTexture() const noexcept { return m_eField.get(); }
     [[nodiscard]] GLuint bFieldTexture() const noexcept { return m_bField.get(); }
@@ -147,6 +161,7 @@ private:
 
     gl::Texture m_eField;
     gl::Texture m_bField;
+    gl::Texture m_edgeMaterial;  // per-component (edge-averaged) sigma / eps_r, packed halves (RGBA32UI)
     gl::Buffer  m_sourceBuffer;  // static per-source geometry (std430 Source[])
     gl::Buffer  m_signalBuffer;  // per-step s(t) values (std430 float[])
 

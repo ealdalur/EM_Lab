@@ -1,6 +1,7 @@
 #include "SimulationGrid.hpp"
 
 #include <glm/gtc/constants.hpp>
+#include <glm/gtc/packing.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -12,10 +13,10 @@ namespace {
 
 // Must match `struct Source` in update_E.comp (std430: 4 x vec4 = 64 bytes).
 struct GPUSource {
-    glm::vec4 centerSoft;  // xyz centre, w softness
-    glm::vec4 halfExtent;  // xyz half extent, w cull radius
+    glm::vec4 center;      // xyz centre
+    glm::vec4 halfExtent;  // xyz flat-top half extents
     glm::vec4 polAmp;      // xyz unit polarisation, w amplitude
-    glm::vec4 reserved;
+    glm::vec4 softness;    // xyz per-axis Gaussian edge widths
 };
 static_assert(sizeof(GPUSource) == 64, "GPUSource must match the std430 layout");
 
@@ -54,14 +55,26 @@ Material MaterialVolume::get(const glm::ivec3& p) const {
 // =============================================================================
 // SourceDesc
 // =============================================================================
+float SourceDesc::sheetCurrentForField(float fieldAmplitude, float wavelength, float softness) {
+    const double k = glm::two_pi<double>() / std::max(static_cast<double>(wavelength), 1e-3);
+    const double s = std::max(static_cast<double>(softness), 0.25);
+    const double spectral = s * std::sqrt(glm::pi<double>()) * std::exp(-0.25 * k * k * s * s);
+    return static_cast<float>(2.0 * fieldAmplitude / spectral);
+}
+
+float SourceDesc::wireCurrentDensity(float current, float softness) {
+    const float s = std::max(softness, 0.25f);
+    return current / (glm::pi<float>() * s * s);
+}
+
 SourceDesc SourceDesc::dipole(const glm::vec3& center, const glm::vec3& axis, float wavelength,
-                              float amplitude, float length) {
+                              float current, float length) {
     SourceDesc s;
     s.center = center;
     s.polarization = axis;
     s.wavelength = wavelength;
-    s.amplitude = amplitude;
-    s.softness = 0.75f;
+    s.amplitude = wireCurrentDensity(current, kDipoleSoftness);
+    s.softness = glm::vec3(kDipoleSoftness);
     const float len2 = glm::dot(axis, axis);
     const glm::vec3 n = len2 > 0.0f ? axis / std::sqrt(len2) : glm::vec3(0.0f, 0.0f, 1.0f);
     s.halfExtent = glm::abs(n) * (0.5f * std::max(length, 0.0f));
@@ -69,17 +82,17 @@ SourceDesc SourceDesc::dipole(const glm::vec3& center, const glm::vec3& axis, fl
 }
 
 SourceDesc SourceDesc::planeWave(int normalAxis, float position, const glm::vec3& polarization,
-                                 float wavelength, float amplitude) {
+                                 float wavelength, float fieldAmplitude) {
     SourceDesc s;
     const int a = std::clamp(normalAxis, 0, 2);
     s.center = glm::vec3(0.0f);
     s.center[a] = position;
     s.halfExtent = glm::vec3(1.0e5f);
     s.halfExtent[a] = 0.0f;
-    s.softness = 0.5f;
+    s.softness = glm::vec3(kSheetSoftness);
     s.polarization = polarization;
     s.wavelength = wavelength;
-    s.amplitude = amplitude;
+    s.amplitude = sheetCurrentForField(fieldAmplitude, wavelength, kSheetSoftness);
     return s;
 }
 
@@ -87,7 +100,8 @@ double SourceDesc::omega() const noexcept {
     return glm::two_pi<double>() / std::max(static_cast<double>(wavelength), 1e-3);
 }
 
-double SourceDesc::signal(double t) const noexcept {
+double SourceDesc::signal(double tAbs) const noexcept {
+    const double t = tAbs - std::max(static_cast<double>(delayPeriods), 0.0) * std::max(static_cast<double>(wavelength), 1e-3);
     if (!enabled || t < 0.0) return 0.0;
     const double period = std::max(static_cast<double>(wavelength), 1e-3); // c = 1
     const double w = omega();
@@ -158,6 +172,10 @@ void SimulationGrid::configure(const GridConfig& requested) {
         };
         m_eField = makeField();
         m_bField = makeField();
+        m_edgeMaterial = gl::createTexture(GL_TEXTURE_3D);
+        glTextureStorage3D(m_edgeMaterial.get(), 1, GL_RGBA32UI, cfg.size.x, cfg.size.y, cfg.size.z);
+        glTextureParameteri(m_edgeMaterial.get(), GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTextureParameteri(m_edgeMaterial.get(), GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         m_allocatedSize = cfg.size;
     }
 
@@ -166,6 +184,9 @@ void SimulationGrid::configure(const GridConfig& requested) {
     const float bInit[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     glClearTexImage(m_eField.get(), 0, GL_RGBA, GL_FLOAT, eInit);
     glClearTexImage(m_bField.get(), 0, GL_RGBA, GL_FLOAT, bInit);
+    const GLuint mInit[4] = {glm::packHalf2x16({0.0f, 0.0f}), glm::packHalf2x16({0.0f, 1.0f}),
+                             glm::packHalf2x16({1.0f, 1.0f}), 0u};
+    glClearTexImage(m_edgeMaterial.get(), 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, mInit);
 
     applySolverUniforms(m_updateE);
     applySolverUniforms(m_updateB);
@@ -196,6 +217,37 @@ void SimulationGrid::uploadMaterials(const MaterialVolume& materials) {
     glTextureSubImage3D(m_bField.get(), 0, 0, 0, 0, m_config.size.x, m_config.size.y, m_config.size.z,
                         GL_RGBA, GL_FLOAT, texels.data());
 
+    // Edge materials: each E component lives on a Yee edge shared by four cells; it gets
+    // the average sigma / eps_r of those cells.
+    //   Ex(i+1/2, j, k): cells (i, j-{0,1}, k-{0,1})   Ey: (i-{0,1}, j, k-{0,1})   Ez: (i-{0,1}, j-{0,1}, k)
+    // Neighbours outside the grid are clamped to the edge cell.
+    const glm::ivec3 s = m_config.size;
+    const std::vector<float>& sig = materials.sigma();
+    const std::vector<float>& eps = materials.epsilonR();
+    auto idx = [&s](int x, int y, int z) {
+        x = std::max(x, 0); y = std::max(y, 0); z = std::max(z, 0);
+        return (static_cast<size_t>(z) * s.y + y) * s.x + x;
+    };
+    constexpr float kHalfMax = 6.0e4f; // half-float range; sigma beyond this is already a perfect conductor
+    std::vector<glm::uvec4> edge(n);
+    for (int z = 0; z < s.z; ++z)
+        for (int y = 0; y < s.y; ++y)
+            for (int x = 0; x < s.x; ++x) {
+                const size_t c00 = idx(x, y, z);
+                const size_t ex[4] = {c00, idx(x, y - 1, z), idx(x, y, z - 1), idx(x, y - 1, z - 1)};
+                const size_t ey[4] = {c00, idx(x - 1, y, z), idx(x, y, z - 1), idx(x - 1, y, z - 1)};
+                const size_t ez[4] = {c00, idx(x - 1, y, z), idx(x, y - 1, z), idx(x - 1, y - 1, z)};
+                auto avg = [](const std::vector<float>& v, const size_t (&c)[4]) {
+                    return 0.25f * (v[c[0]] + v[c[1]] + v[c[2]] + v[c[3]]);
+                };
+                const glm::vec3 sg = glm::min(glm::vec3(avg(sig, ex), avg(sig, ey), avg(sig, ez)), glm::vec3(kHalfMax));
+                const glm::vec3 ep = glm::vec3(avg(eps, ex), avg(eps, ey), avg(eps, ez));
+                edge[c00] = glm::uvec4(glm::packHalf2x16({sg.x, sg.y}), glm::packHalf2x16({sg.z, ep.x}),
+                                       glm::packHalf2x16({ep.y, ep.z}), 0u);
+            }
+    glTextureSubImage3D(m_edgeMaterial.get(), 0, 0, 0, 0, s.x, s.y, s.z, GL_RGBA_INTEGER, GL_UNSIGNED_INT,
+                        edge.data());
+
     m_stepCount = 0;
 }
 
@@ -209,10 +261,10 @@ void SimulationGrid::setSources(const std::vector<SourceDesc>& sources) {
         const float len = glm::length(s.polarization);
         if (!s.enabled || !(len > 1e-6f) || !std::isfinite(len)) continue;
 
-        const float soft = std::max(s.softness, 0.25f);
         GPUSource g{};
-        g.centerSoft = glm::vec4(s.center, soft);
-        g.halfExtent = glm::vec4(glm::clamp(s.halfExtent, glm::vec3(0.0f), glm::vec3(1.0e5f)), 3.5f * soft);
+        g.center = glm::vec4(s.center, 0.0f);
+        g.halfExtent = glm::vec4(glm::clamp(s.halfExtent, glm::vec3(0.0f), glm::vec3(1.0e5f)), 0.0f);
+        g.softness = glm::vec4(glm::max(s.softness, glm::vec3(0.25f)), 0.0f);
         g.polAmp = glm::vec4(s.polarization / len, s.amplitude);
         packed.push_back(g);
         m_sources.push_back(s);
@@ -233,7 +285,7 @@ void SimulationGrid::resetFields() {
     m_stepCount = 0;
 }
 
-void SimulationGrid::step(int count) {
+void SimulationGrid::step(int count, const std::function<void()>& afterEachStep) {
     if (count <= 0) return;
 
     // Pre-compute every source's temporal signal for all sub-steps of this call in
@@ -271,14 +323,24 @@ void SimulationGrid::step(int count) {
         m_updateE.set("uSignalBase", k * static_cast<int>(nSrc));
         bindImage(0, m_eField.get());
         glBindTextureUnit(1, m_bField.get());
+        glBindTextureUnit(2, m_edgeMaterial.get());
         m_updateE.dispatchCovering(cells);
         glMemoryBarrier(kFieldBarrier);
+
+        ++m_stepCount; // observers see the time of the step that just completed
+        if (afterEachStep) {
+            afterEachStep();
+            glMemoryBarrier(kFieldBarrier);
+            // Re-bind the solver's buffers in case the observer changed SSBO bindings 0/1.
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_sourceBuffer.get());
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_signalBuffer.get());
+        }
     }
 
     glBindTextureUnit(1, 0);
-    m_stepCount += static_cast<std::uint64_t>(count);
 }
 
 size_t SimulationGrid::gpuMemoryBytes() const noexcept {
-    return 2ull * static_cast<size_t>(m_config.size.x) * m_config.size.y * m_config.size.z * sizeof(glm::vec4);
+    return static_cast<size_t>(m_config.size.x) * m_config.size.y * m_config.size.z *
+           (2 * sizeof(glm::vec4) + sizeof(glm::uvec4));
 }

@@ -1,7 +1,6 @@
 #include "VolumeRenderer.hpp"
 
 #include "Camera.hpp"
-#include "FieldAnalyzer.hpp"
 #include "SimulationGrid.hpp"
 
 #include <glm/gtc/matrix_inverse.hpp>
@@ -168,37 +167,31 @@ void VolumeRenderer::appendCross(std::vector<LineVertex>& out, const glm::vec3& 
     }
 }
 
-void VolumeRenderer::buildOverlay(std::vector<LineVertex>& out, const glm::ivec3& g, int pml,
-                                  const glm::vec3& probe, const FluxSurface& flux) {
+void VolumeRenderer::buildGridOverlay(std::vector<LineVertex>& out, const glm::ivec3& g, int pml) {
     out.clear();
     const glm::vec3 n(g);
-    auto W = [&g](const glm::vec3& p) { return latticeToWorld(g, p); };
+    appendBox(out, latticeToWorld(g, glm::vec3(0.0f)), latticeToWorld(g, n), {0.75f, 0.8f, 0.9f, 0.30f});
+    if (pml > 0)
+        appendBox(out, latticeToWorld(g, glm::vec3(static_cast<float>(pml))),
+                  latticeToWorld(g, n - static_cast<float>(pml)), {0.3f, 0.6f, 1.0f, 0.12f});
+}
 
-    appendBox(out, W(glm::vec3(0.0f)), W(n), {0.75f, 0.8f, 0.9f, 0.30f});
-    if (pml > 0) appendBox(out, W(glm::vec3(static_cast<float>(pml))), W(n - static_cast<float>(pml)),
-                           {0.3f, 0.6f, 1.0f, 0.12f});
-
-    appendCross(out, W(probe), 4.0f * worldScale(g), {1.0f, 0.9f, 0.2f, 0.9f});
-
-    const glm::vec4 fluxColor{0.25f, 1.0f, 0.45f, 0.55f};
-    if (flux.kind == FluxSurface::Kind::Box) {
-        appendBox(out, W(glm::vec3(flux.boxMin)), W(glm::vec3(flux.boxMax)), fluxColor);
-    } else {
-        const int u = flux.axis == 0 ? 1 : 0;
-        const int v = flux.axis == 2 ? 1 : 2;
-        glm::vec3 q[4];
-        const float us[4] = {float(flux.rectMin.x), float(flux.rectMax.x), float(flux.rectMax.x), float(flux.rectMin.x)};
-        const float vs[4] = {float(flux.rectMin.y), float(flux.rectMin.y), float(flux.rectMax.y), float(flux.rectMax.y)};
-        for (int i = 0; i < 4; ++i) {
-            glm::vec3 p(0.0f);
-            p[flux.axis] = static_cast<float>(flux.index);
-            p[u] = us[i];
-            p[v] = vs[i];
-            q[i] = W(p);
-        }
-        for (int i = 0; i < 4; ++i) {
-            out.push_back({q[i], fluxColor});
-            out.push_back({q[(i + 1) % 4], fluxColor});
+void VolumeRenderer::appendSources(std::vector<LineVertex>& out, const glm::ivec3& g,
+                                   const std::vector<SourceDesc>& sources) {
+    const glm::vec4 color{1.0f, 0.45f, 0.3f, 0.6f};
+    const glm::vec3 n(g);
+    for (const SourceDesc& s : sources) {
+        const glm::vec3 lo = glm::clamp(s.center - s.halfExtent, glm::vec3(0.0f), n);
+        const glm::vec3 hi = glm::clamp(s.center + s.halfExtent, glm::vec3(0.0f), n);
+        const glm::vec3 ext = hi - lo;
+        const int extended = (ext.x > 0.5f) + (ext.y > 0.5f) + (ext.z > 0.5f);
+        if (extended == 0) {
+            appendCross(out, latticeToWorld(g, s.center), 2.0f * worldScale(g), color);
+        } else if (extended == 1) {
+            out.push_back({latticeToWorld(g, lo), color});
+            out.push_back({latticeToWorld(g, hi), color});
+        } else {
+            appendBox(out, latticeToWorld(g, lo), latticeToWorld(g, hi), color);
         }
     }
 }

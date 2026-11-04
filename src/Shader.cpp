@@ -145,6 +145,10 @@ void Shader::set(const char* n, const glm::ivec2& v) const { glProgramUniform2iv
 void Shader::set(const char* n, const glm::ivec3& v) const { glProgramUniform3iv(id(), location(n), 1, glm::value_ptr(v)); }
 void Shader::set(const char* n, const glm::mat4& m) const  { glProgramUniformMatrix4fv(id(), location(n), 1, GL_FALSE, glm::value_ptr(m)); }
 
+void Shader::setArray(const char* n, const int* values, int count) const {
+    glProgramUniform1iv(id(), location(n), count, values);
+}
+
 glm::uvec3 Shader::workGroupSize() const {
     if (m_localSize.x != 0u) return m_localSize;
     GLint size[3] = {1, 1, 1};

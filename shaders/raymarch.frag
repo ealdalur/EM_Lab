@@ -178,7 +178,7 @@ void main() {
             vec3 glassCol = shadeSurface(n, rd, vec3(0.30, 0.65, 0.70), 0.6);
             vec3 lossyCol = shadeSurface(n, rd, vec3(0.35, 0.22, 0.12), 0.1);
             float wM = metal * uMaterialOpacity;
-            float wG = glass * uMaterialOpacity * 0.18;
+            float wG = glass * uMaterialOpacity * 0.02;  // thick dielectrics stay see-through
             float wA = absorber * uMaterialOpacity * 0.4;
             matExt = wM + wG + wA;
             surface = (metalCol * wM + glassCol * wG + lossyCol * wA) / max(matExt, 1e-6);

@@ -37,6 +37,8 @@ public:
     void set(const char* name, const glm::ivec2& v) const;
     void set(const char* name, const glm::ivec3& v) const;
     void set(const char* name, const glm::mat4& m) const;
+    // int[] uniform array; `name` is the array name without subscript.
+    void setArray(const char* name, const int* values, int count) const;
 
     // Compute workgroup size declared in the shader (layout(local_size_*)).
     [[nodiscard]] glm::uvec3 workGroupSize() const;

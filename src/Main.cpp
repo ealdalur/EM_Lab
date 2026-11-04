@@ -2,21 +2,21 @@
 // EM_Lab - GPU FDTD electromagnetic wave simulator with volumetric raymarching.
 //
 // Application lifecycle (SDL3 + OpenGL 4.6 Core), input handling, camera
-// control, the simulate -> measure -> render loop and console/HUD reporting.
+// control, Lua scene loading (with hot reload and interactive parameters) and
+// the simulate -> measure -> render loop with console/HUD reporting.
 // =============================================================================
 
 #include "Camera.hpp"
 #include "Environment.hpp"
-#include "FieldAnalyzer.hpp"
 #include "GLUtils.hpp"
 #include "GpuSelection.hpp"
+#include "Instruments.hpp"
+#include "ScriptEngine.hpp"
 #include "SimulationGrid.hpp"
 #include "VolumeRenderer.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
-
-#include <glm/gtc/constants.hpp>
 
 #include <algorithm>
 #include <array>
@@ -25,13 +25,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
-using scenes::SceneId;
 
 namespace {
 
@@ -39,16 +39,33 @@ namespace {
 // Command line
 // -----------------------------------------------------------------------------
 struct Options {
-    int  scene = 1;          // 1-based scene index
+    int  scene = 1;          // 1-based index into the scenes directory
+    std::string script;      // explicit script path (overrides --scene)
+    std::map<std::string, std::string> sets; // --set name=value parameter overrides
     int  frames = 0;         // > 0: run this many frames then exit (self-test / benchmark)
     int  stepsPerFrame = 2;
     bool vsync = true;
     bool glDebug = false;
+    bool listScenes = false;
     int  width = 1600;
     int  height = 900;
-    std::string screenshot; // save the last self-test frame to this BMP file
-    std::string keys;       // key presses replayed at startup (e.g. "3..." or "2g"), for scripting/tests
+    std::string screenshot;  // save the last self-test frame to this BMP file
+    std::string keys;        // key presses replayed at startup, for scripting/tests
 };
+
+void printUsage() {
+    std::printf(
+        "EM_Lab [options]\n"
+        "  --script FILE.lua      load a scene script\n"
+        "  --scene N              load the N-th script of the scenes directory (default 1)\n"
+        "  --set NAME=VALUE       override a script param{} (repeatable)\n"
+        "  --list                 list the bundled scenes and exit\n"
+        "  --steps N              simulation steps per frame\n"
+        "  --novsync  --gldebug  --width W  --height H\n"
+        "  --frames N             run N frames then exit (exit code 2 = non-finite fields)\n"
+        "  --keys KEYS            replay key presses at startup\n"
+        "  --screenshot FILE.bmp  save the last frame of a --frames run\n");
+}
 
 Options parseOptions(int argc, char** argv) {
     Options o;
@@ -57,36 +74,67 @@ Options parseOptions(int argc, char** argv) {
 #endif
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        auto next = [&](int fallback) { return (i + 1 < argc) ? std::atoi(argv[++i]) : fallback; };
-        if (a == "--scene") o.scene = next(o.scene);
-        else if (a == "--frames") o.frames = next(0);
-        else if (a == "--steps") o.stepsPerFrame = next(o.stepsPerFrame);
+        const bool hasValue = i + 1 < argc;
+        auto nextInt = [&](int fallback) { return hasValue ? std::atoi(argv[++i]) : fallback; };
+        if (a == "--scene") o.scene = nextInt(o.scene);
+        else if (a == "--script" && hasValue) o.script = argv[++i];
+        else if (a == "--set" && hasValue) {
+            const std::string kv = argv[++i];
+            const auto eq = kv.find('=');
+            if (eq == std::string::npos || eq == 0) std::fprintf(stderr, "--set expects NAME=VALUE (got '%s')\n", kv.c_str());
+            else o.sets[kv.substr(0, eq)] = kv.substr(eq + 1);
+        }
+        else if (a == "--list") o.listScenes = true;
+        else if (a == "--frames") o.frames = nextInt(0);
+        else if (a == "--steps") o.stepsPerFrame = nextInt(o.stepsPerFrame);
         else if (a == "--novsync") o.vsync = false;
         else if (a == "--gldebug") o.glDebug = true;
-        else if (a == "--width") o.width = next(o.width);
-        else if (a == "--height") o.height = next(o.height);
-        else if (a == "--screenshot" && i + 1 < argc) o.screenshot = argv[++i];
-        else if (a == "--keys" && i + 1 < argc) o.keys = argv[++i];
-        else if (a == "--help" || a == "-h") {
-            std::printf("EM_Lab [--scene 1-5] [--steps N] [--frames N] [--novsync] [--gldebug] "
-                        "[--width W] [--height H] [--screenshot file.bmp] [--keys KEYS]\n");
-            std::exit(0);
-        }
+        else if (a == "--width") o.width = nextInt(o.width);
+        else if (a == "--height") o.height = nextInt(o.height);
+        else if (a == "--screenshot" && hasValue) o.screenshot = argv[++i];
+        else if (a == "--keys" && hasValue) o.keys = argv[++i];
+        else if (a == "--help" || a == "-h") { printUsage(); std::exit(0); }
+        else std::fprintf(stderr, "Ignoring unknown option '%s' (see --help)\n", a.c_str());
     }
-    o.scene = std::clamp(o.scene, 1, static_cast<int>(SceneId::Count));
     o.stepsPerFrame = std::clamp(o.stepsPerFrame, 0, 64);
     return o;
 }
 
-fs::path findShaderDir() {
+// Looks next to the executable first, then in the source tree (IDE / build-tree runs).
+fs::path findDataDir(const char* name, const char* marker, const char* fallback) {
     if (const char* base = SDL_GetBasePath()) {
-        const fs::path p = fs::path(base) / "shaders";
-        if (fs::exists(p / "update_E.comp")) return p;
+        const fs::path p = fs::path(base) / name;
+        if (fs::exists(p / marker)) return p;
     }
-    const fs::path fallback(EMLAB_SHADER_DIR);
-    if (fs::exists(fallback / "update_E.comp")) return fallback;
-    throw std::runtime_error("Cannot locate the shaders directory (looked next to the executable and in " +
-                             fallback.string() + ")");
+    const fs::path f(fallback);
+    if (fs::exists(f / marker)) return f;
+    return {};
+}
+
+std::vector<fs::path> listScripts(const fs::path& dir) {
+    std::vector<fs::path> out;
+    std::error_code ec;
+    if (dir.empty() || !fs::is_directory(dir, ec)) return out;
+    for (const auto& e : fs::directory_iterator(dir, ec))
+        if (e.is_regular_file() && e.path().extension() == ".lua") out.push_back(e.path());
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool sameGrid(const GridConfig& a, const GridConfig& b) {
+    return a.size == b.size && a.courant == b.courant && a.pmlThickness == b.pmlThickness &&
+           a.pmlSigmaMax == b.pmlSigmaMax && a.pmlGrading == b.pmlGrading;
+}
+
+bool sameMaterials(const MaterialVolume& a, const MaterialVolume& b) {
+    return a.size() == b.size() && a.sigma() == b.sigma() && a.epsilonR() == b.epsilonR();
+}
+
+const char* keyName(char k) {
+    static char buf[4];
+    buf[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(k)));
+    buf[1] = '\0';
+    return buf;
 }
 
 // -----------------------------------------------------------------------------
@@ -140,25 +188,27 @@ public:
 
 private:
     struct GpuResources {
-        explicit GpuResources(const fs::path& shaderDir)
-            : grid(shaderDir), renderer(shaderDir), analyzer(shaderDir) {}
+        explicit GpuResources(const fs::path& shaderDir) : grid(shaderDir), renderer(shaderDir), instruments(shaderDir) {}
         SimulationGrid grid;
         VolumeRenderer renderer;
-        FieldAnalyzer analyzer;
+        Instruments instruments;
         GpuTimer simTimer;
         GpuTimer renderTimer;
     };
 
     void initWindowAndContext();
-    void loadScene(SceneId id, bool resetCamera = true);
+    bool loadScript(const fs::path& path, const std::map<std::string, std::string>& overrides, bool newScene);
+    void loadSceneIndex(int index);
+    void applyScene(ScriptResult&& result, bool newScene);
+    void applyView(const Environment& env);
+    void reloadWithParams();
+    void checkHotReload();
     void handleEvent(const SDL_Event& e);
     void handleKey(const SDL_KeyboardEvent& k);
     void updateCamera(float dt);
-    void measure();
     void updateTitle(double fps);
     void printHelp() const;
-    void printReport() const;
-    void moveProbe(const glm::vec3& delta);
+    void printParams() const;
     void setFlyMode(bool fly);
     void saveScreenshot(const std::string& path) const;
 
@@ -170,19 +220,20 @@ private:
     Camera m_camera;
     RenderSettings m_render;
     glm::ivec2 m_fbSize{0};
+    std::vector<LineVertex> m_overlay;
 
     // Scene state
-    SceneId m_sceneId = SceneId::DoubleSlit;
-    std::string m_sceneName;
-    glm::vec3 m_probePos{0.0f};
-    FluxSurface m_flux;
-    std::vector<LineVertex> m_overlay;
-    bool m_overlayDirty = true;
-    scenes::DoubleSlitParams m_slitParams;
-    scenes::FaradayCageParams m_cageParams;
-    scenes::AntennaArrayParams m_arrayParams;
-    scenes::DipoleParams m_dipoleParams;
-    scenes::DielectricLensParams m_lensParams;
+    std::vector<fs::path> m_sceneList;
+    int m_sceneIndex = -1;
+    fs::path m_scriptPath;
+    fs::file_time_type m_scriptTime{};
+    double m_hotReloadTimer = 0.0;
+    bool m_hasScene = false;
+    bool m_scriptError = false;
+    std::string m_sceneName = "(no scene)";
+    std::vector<ScriptParam> m_params;
+    GridConfig m_gridConfig;
+    MaterialVolume m_materials;
 
     // Run state
     bool m_running = true;
@@ -191,21 +242,47 @@ private:
     int m_stepsPerFrame = 2;
     bool m_dragRotate = false;
     bool m_dragPan = false;
-    ProbeSample m_probe;
-    std::uint64_t m_probeStep = 0;   // step at which m_probe was measured
-    double m_probeTime = 0.0;
-    bool m_unstable = false;
     bool m_screenshotRequested = false;
     std::uint64_t m_frame = 0;
 };
 
 Application::Application(const Options& opt) : m_opt(opt), m_stepsPerFrame(opt.stepsPerFrame) {
+    // Prefer the source-tree scenes so that editing them hot-reloads; fall back to the
+    // copy shipped next to the executable.
+    fs::path sceneDir(EMLAB_SCENE_DIR);
+    std::error_code ec;
+    if (!fs::is_directory(sceneDir, ec)) sceneDir = findDataDir("scenes", "", EMLAB_SCENE_DIR);
+    m_sceneList = listScripts(sceneDir);
+    if (opt.listScenes) {
+        for (size_t i = 0; i < m_sceneList.size(); ++i)
+            std::printf("%2zu  %s\n", i + 1, m_sceneList[i].filename().string().c_str());
+        std::exit(0);
+    }
+
     initWindowAndContext();
-    const fs::path shaderDir = findShaderDir();
-    std::printf("Shaders: %s\n", shaderDir.string().c_str());
+    const fs::path shaderDir = findDataDir("shaders", "update_E.comp", EMLAB_SHADER_DIR);
+    if (shaderDir.empty()) throw std::runtime_error("Cannot locate the shaders directory");
+    std::printf("Shaders: %s\nScenes:  %zu script(s) in %s\n", shaderDir.string().c_str(), m_sceneList.size(),
+                m_sceneList.empty() ? "(none found)" : m_sceneList.front().parent_path().string().c_str());
     m_gpu = std::make_unique<GpuResources>(shaderDir);
-    loadScene(static_cast<SceneId>(opt.scene - 1));
+
+    bool loaded = false;
+    if (!opt.script.empty()) {
+        loaded = loadScript(opt.script, opt.sets, true);
+    } else if (!m_sceneList.empty()) {
+        m_sceneIndex = std::clamp(opt.scene, 1, static_cast<int>(m_sceneList.size())) - 1;
+        loaded = loadScript(m_sceneList[static_cast<size_t>(m_sceneIndex)], opt.sets, true);
+    }
+    if (!loaded) {
+        // Keep the application usable (fix the script and press F5 / save to hot-reload).
+        ScriptResult empty;
+        GridConfig g;
+        g.size = glm::ivec3(96);
+        empty.env = EnvironmentBuilder("Empty scene", g).build();
+        applyScene(std::move(empty), true);
+    }
     printHelp();
+
     // Replay scripted key presses (letters/digits/punctuation map 1:1 to SDL keycodes).
     for (char c : opt.keys) {
         SDL_KeyboardEvent k{};
@@ -259,63 +336,148 @@ void Application::initWindowAndContext() {
     m_camera.setAspect(h > 0 ? static_cast<float>(w) / static_cast<float>(h) : 1.0f);
 }
 
-void Application::loadScene(SceneId id, bool resetCamera) {
-    Environment env;
-    switch (id) {
-        case SceneId::DoubleSlit:     env = scenes::doubleSlit(m_slitParams); break;
-        case SceneId::FaradayCage:    env = scenes::faradayCage(m_cageParams); break;
-        case SceneId::AntennaArray:   env = scenes::antennaArray(m_arrayParams); break;
-        case SceneId::Dipole:         env = scenes::dipole(m_dipoleParams); break;
-        case SceneId::DielectricLens: env = scenes::dielectricLens(m_lensParams); break;
-        default: return;
+// -----------------------------------------------------------------------------
+// Scene loading
+// -----------------------------------------------------------------------------
+bool Application::loadScript(const fs::path& path, const std::map<std::string, std::string>& overrides, bool newScene) {
+    ScriptResult result;
+    try {
+        result = ScriptEngine::run(path, overrides);
+    } catch (const ScriptError& e) {
+        std::fprintf(stderr, "\nSCRIPT ERROR in %s:\n  %s\n", path.filename().string().c_str(), e.what());
+        m_scriptError = true;
+        // Track the file anyway so saving a fix hot-reloads it.
+        m_scriptPath = path;
+        std::error_code ec;
+        m_scriptTime = fs::last_write_time(path, ec);
+        return false;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "\nERROR while building %s: %s\n", path.filename().string().c_str(), e.what());
+        m_scriptError = true;
+        return false;
     }
+    m_scriptError = false;
+    m_scriptPath = path;
+    std::error_code ec;
+    m_scriptTime = fs::last_write_time(path, ec);
+    applyScene(std::move(result), newScene || !m_hasScene);
+    return true;
+}
 
+void Application::loadSceneIndex(int index) {
+    if (index < 0 || index >= static_cast<int>(m_sceneList.size())) return;
+    m_sceneIndex = index;
+    loadScript(m_sceneList[static_cast<size_t>(index)], {}, true);
+}
+
+void Application::applyScene(ScriptResult&& result, bool newScene) {
+    Environment& env = result.env;
     SimulationGrid& grid = m_gpu->grid;
-    grid.configure(env.grid);
-    grid.uploadMaterials(env.materials);
-    grid.setSources(env.sources);
-    m_gpu->analyzer.resetFluxHistory();
 
-    m_sceneId = id;
-    m_sceneName = env.name;
-    m_probePos = env.probe;
-    m_flux = env.flux;
-    m_unstable = false;
-    m_overlayDirty = true;
-    if (resetCamera) {
-        m_render.gainE = env.view.gainE;
-        m_render.gainB = env.view.gainB;
-        // Signed-field mode shows the component the (first) source drives.
-        if (!env.sources.empty()) {
-            const glm::vec3 pol = glm::abs(env.sources.front().polarization);
-            m_render.signedAxis = (pol.x >= pol.y && pol.x >= pol.z) ? 0 : (pol.y >= pol.z ? 1 : 2);
-        }
-        m_render.clipMin = glm::vec3(0.0f);
-        m_render.clipMax = glm::vec3(1.0f);
-        m_camera.setOrbit(glm::vec3(0.0f), env.view.cameraDistance, env.view.cameraYawDeg, env.view.cameraPitchDeg);
-        setFlyMode(false);
+    // Keep the running fields when only sources / instruments / view changed
+    // (live parameter tweaks such as beam steering); rebuild otherwise.
+    const bool keepFields = m_hasScene && !newScene && sameGrid(env.grid, m_gridConfig) &&
+                            sameMaterials(env.materials, m_materials);
+    if (!keepFields) {
+        grid.configure(env.grid);
+        grid.uploadMaterials(env.materials);
+        m_gridConfig = grid.config();
+        m_materials = std::move(env.materials);
     }
+    grid.setSources(env.sources);
+    m_gpu->instruments.configure(grid, env, result.outputDir, result.warnings);
+    m_params = std::move(result.params);
+    m_hasScene = true;
+    m_sceneName = env.name;
+    if (newScene) applyView(env);
 
-    const glm::ivec3 s = grid.size();
-    std::printf("\n=== Scene %d: %s ===\n%s\n", static_cast<int>(id) + 1, env.name.c_str(), env.description.c_str());
-    std::printf("Grid %dx%dx%d (%.1f M cells, %.0f MB GPU), dt = %.3f, PML %d cells, %zu source(s)\n", s.x, s.y,
-                s.z, static_cast<double>(s.x) * s.y * s.z * 1e-6, static_cast<double>(grid.gpuMemoryBytes()) / (1 << 20),
-                grid.dt(), grid.config().pmlThickness, grid.sources().size());
+    for (const std::string& w : result.warnings) std::fprintf(stderr, "  warning: %s\n", w.c_str());
+    if (newScene) {
+        const glm::ivec3 s = grid.size();
+        std::printf("\n=== %s ===  (%s)\n", env.name.c_str(), m_scriptPath.filename().string().c_str());
+        if (!env.description.empty()) std::printf("%s\n", env.description.c_str());
+        std::printf("Grid %dx%dx%d (%.1f M cells, %.0f MB GPU), dt = %.3f, PML %d, lambda_ref = %.1f cells "
+                    "(%.4g GHz at %.3g mm cells), %zu source term(s)\n",
+                    s.x, s.y, s.z, static_cast<double>(s.x) * s.y * s.z * 1e-6,
+                    static_cast<double>(grid.gpuMemoryBytes()) / (1 << 20), grid.dt(), grid.config().pmlThickness,
+                    env.referenceWavelength, 299792458.0 / (env.referenceWavelength * env.cellSize) * 1e-9,
+                    env.cellSize * 1e3, grid.sources().size());
+        printParams();
+    } else if (!keepFields) {
+        std::printf("Reloaded '%s' (geometry changed: fields reset)\n", env.name.c_str());
+    } else {
+        std::printf("Reloaded '%s' (fields kept)\n", env.name.c_str());
+    }
+}
+
+void Application::applyView(const Environment& env) {
+    const ViewHints& v = env.view;
+    RenderSettings r;
+    r.resolutionScale = m_render.resolutionScale; // user preference, not scene content
+    if (v.gainE) r.gainE = *v.gainE;
+    if (v.gainB) r.gainB = *v.gainB;
+    if (v.exposure) r.exposure = *v.exposure;
+    if (v.density) r.density = *v.density;
+    if (v.stepVoxels) r.stepVoxels = *v.stepVoxels;
+    if (v.overlay) r.showOverlay = *v.overlay;
+    if (v.mode) r.mode = static_cast<RenderSettings::Mode>(std::clamp(*v.mode, 0, 4));
+    if (v.signedAxis) {
+        r.signedAxis = *v.signedAxis;
+    } else if (!env.sources.empty()) {
+        const glm::vec3 pol = glm::abs(env.sources.front().polarization);
+        r.signedAxis = (pol.x >= pol.y && pol.x >= pol.z) ? 0 : (pol.y >= pol.z ? 1 : 2);
+    }
+    m_render = r;
+    if (v.stepsPerFrame) m_stepsPerFrame = *v.stepsPerFrame;
+
+    const glm::ivec3 g = env.grid.size;
+    const glm::vec3 target = VolumeRenderer::latticeToWorld(g, v.target.value_or(glm::vec3(g) * 0.5f));
+    m_camera.setOrbit(target, v.cameraDistance, v.cameraYawDeg, v.cameraPitchDeg);
+    setFlyMode(false);
+}
+
+void Application::reloadWithParams() {
+    std::map<std::string, std::string> overrides;
+    for (const ScriptParam& p : m_params) overrides[p.name] = p.overrideString();
+    loadScript(m_scriptPath, overrides, false);
+}
+
+void Application::checkHotReload() {
+    if (m_scriptPath.empty()) return;
+    std::error_code ec;
+    const auto t = fs::last_write_time(m_scriptPath, ec);
+    if (ec || t == m_scriptTime) return;
+    m_scriptTime = t;
+    std::printf("\n%s changed on disk: reloading...\n", m_scriptPath.filename().string().c_str());
+    reloadWithParams();
+}
+
+void Application::printParams() const {
+    if (m_params.empty()) return;
+    std::printf("Parameters:\n");
+    for (const ScriptParam& p : m_params) {
+        std::string keys;
+        if (p.keyToggle) keys = std::string("[") + keyName(p.keyToggle) + "]";
+        if (p.keyDecrease) keys = std::string("[") + keyName(p.keyDecrease) + "/" + keyName(p.keyIncrease) + "]";
+        std::printf("  %-8s %-24s = %s\n", keys.c_str(), p.label.c_str(), p.valueString().c_str());
+    }
 }
 
 void Application::printHelp() const {
     std::printf(
         "\nControls\n"
-        "  1-5            load scene (1 double slit, 2 Faraday cage, 3 antenna array, 4 dipole, 5 lens)\n"
+        "  1-9, 0         load bundled scene 1..10      F6 / F7  previous / next scene\n"
+        "  F5             reload script (also automatic when the file is saved; drag & drop a .lua to open)\n"
         "  LMB drag       orbit / look      RMB or MMB drag  pan      wheel  zoom\n"
         "  C              toggle orbit / fly camera (fly: WASD, Q/E down/up, Shift fast)\n"
         "  Space          pause / resume    N  single step (paused)     R  reset fields\n"
         "  [ / ]          steps per frame   - / +  visual gain          M  render mode\n"
         "  V              signed-mode axis  K / L  cutaway (z) down/up  O  overlay  H  half-res\n"
-        "  F3 / F4        ray step size     Arrows/PgUp/PgDn  move probe (Shift x5)\n"
-        "  , / .          antenna phase shift -/+ 15 deg (scene 3)\n"
-        "  G              toggle Faraday cage (scene 2)   T  CW / pulsed dipole (scene 4)\n"
-        "  P              print probe + flux report       F12 screenshot   F1 help   Esc quit\n\n");
+        "  F3 / F4        ray step size     Tab  select probe  Arrows/PgUp/PgDn  move probe (Shift x5)\n"
+        "  P              print measurement report      F12 screenshot   F1 help   Esc quit\n"
+        "  Script parameters use the keys listed under 'Parameters' (from: %s)\n\n",
+        ScriptEngine::kParamKeys);
+    printParams();
 }
 
 void Application::setFlyMode(bool fly) {
@@ -323,98 +485,90 @@ void Application::setFlyMode(bool fly) {
     SDL_SetWindowRelativeMouseMode(m_window, fly);
 }
 
-void Application::moveProbe(const glm::vec3& delta) {
-    m_probePos = glm::clamp(m_probePos + delta, glm::vec3(0.0f), glm::vec3(m_gpu->grid.size() - 1));
-    m_overlayDirty = true;
-    measure();
-}
-
+// -----------------------------------------------------------------------------
+// Input
+// -----------------------------------------------------------------------------
 void Application::handleKey(const SDL_KeyboardEvent& k) {
     const bool shift = (k.mod & SDL_KMOD_SHIFT) != 0;
     const float probeStep = shift ? 5.0f : 1.0f;
+    Instruments& inst = m_gpu->instruments;
+    const glm::ivec3 gs = m_gpu->grid.size();
 
     switch (k.key) {
         case SDLK_ESCAPE:
             if (m_camera.mode() == Camera::Mode::Fly) setFlyMode(false);
             else m_running = false;
-            break;
+            return;
         case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4: case SDLK_5:
-            loadScene(static_cast<SceneId>(k.key - SDLK_1));
-            break;
-        case SDLK_SPACE: m_paused = !m_paused; break;
-        case SDLK_N: m_singleStep = true; break;
+        case SDLK_6: case SDLK_7: case SDLK_8: case SDLK_9:
+            loadSceneIndex(static_cast<int>(k.key - SDLK_1));
+            return;
+        case SDLK_0: loadSceneIndex(9); return;
+        case SDLK_F6: if (!m_sceneList.empty()) loadSceneIndex((std::max(m_sceneIndex, 0) + static_cast<int>(m_sceneList.size()) - 1) % static_cast<int>(m_sceneList.size())); return;
+        case SDLK_F7: if (!m_sceneList.empty()) loadSceneIndex((m_sceneIndex + 1) % static_cast<int>(m_sceneList.size())); return;
+        case SDLK_F5:
+            std::printf("\nReloading %s...\n", m_scriptPath.filename().string().c_str());
+            reloadWithParams();
+            return;
+        case SDLK_SPACE: m_paused = !m_paused; return;
+        case SDLK_N: m_singleStep = true; return;
         case SDLK_R:
             m_gpu->grid.resetFields();
-            m_gpu->analyzer.resetFluxHistory();
-            m_unstable = false;
-            break;
-        case SDLK_LEFTBRACKET:  m_stepsPerFrame = std::max(m_stepsPerFrame - 1, 1); break;
-        case SDLK_RIGHTBRACKET: m_stepsPerFrame = std::min(m_stepsPerFrame + 1, 64); break;
-        case SDLK_EQUALS: case SDLK_KP_PLUS:
-            m_render.gainE *= 1.25f; m_render.gainB *= 1.25f; break;
-        case SDLK_MINUS: case SDLK_KP_MINUS:
-            m_render.gainE /= 1.25f; m_render.gainB /= 1.25f; break;
+            inst.resetHistory(m_gpu->grid);
+            return;
+        case SDLK_LEFTBRACKET:  m_stepsPerFrame = std::max(m_stepsPerFrame - 1, 1); return;
+        case SDLK_RIGHTBRACKET: m_stepsPerFrame = std::min(m_stepsPerFrame + 1, 64); return;
+        case SDLK_EQUALS: case SDLK_KP_PLUS: m_render.gainE *= 1.25f; m_render.gainB *= 1.25f; return;
+        case SDLK_MINUS: case SDLK_KP_MINUS: m_render.gainE /= 1.25f; m_render.gainB /= 1.25f; return;
         case SDLK_M: {
             const int n = static_cast<int>(RenderSettings::Mode::Count);
             m_render.mode = static_cast<RenderSettings::Mode>((static_cast<int>(m_render.mode) + 1) % n);
             std::printf("Render mode: %s\n", RenderSettings::modeName(m_render.mode));
-            break;
+            return;
         }
         case SDLK_V:
             m_render.signedAxis = (m_render.signedAxis + 1) % 3;
             std::printf("Signed mode shows E%c\n", "xyz"[m_render.signedAxis]);
-            break;
-        case SDLK_C: setFlyMode(m_camera.mode() == Camera::Mode::Orbit); break;
-        case SDLK_K: m_render.clipMax.z = std::max(m_render.clipMax.z - 0.05f, 0.05f); break;
-        case SDLK_L: m_render.clipMax.z = std::min(m_render.clipMax.z + 0.05f, 1.0f); break;
-        case SDLK_O: m_render.showOverlay = !m_render.showOverlay; break;
+            return;
+        case SDLK_C: setFlyMode(m_camera.mode() == Camera::Mode::Orbit); return;
+        case SDLK_K: m_render.clipMax.z = std::max(m_render.clipMax.z - 0.05f, 0.05f); return;
+        case SDLK_L: m_render.clipMax.z = std::min(m_render.clipMax.z + 0.05f, 1.0f); return;
+        case SDLK_O: m_render.showOverlay = !m_render.showOverlay; return;
         case SDLK_H:
             m_render.resolutionScale = m_render.resolutionScale < 0.99f ? 1.0f : 0.5f;
             std::printf("Render scale: %.2f\n", m_render.resolutionScale);
-            break;
+            return;
         case SDLK_F3: m_render.stepVoxels = std::max(m_render.stepVoxels / 1.25f, 0.1f);
-                      std::printf("Ray step: %.2f voxels\n", m_render.stepVoxels); break;
+                      std::printf("Ray step: %.2f voxels\n", m_render.stepVoxels); return;
         case SDLK_F4: m_render.stepVoxels = std::min(m_render.stepVoxels * 1.25f, 4.0f);
-                      std::printf("Ray step: %.2f voxels\n", m_render.stepVoxels); break;
-        case SDLK_LEFT:     moveProbe({-probeStep, 0.0f, 0.0f}); break;
-        case SDLK_RIGHT:    moveProbe({+probeStep, 0.0f, 0.0f}); break;
-        case SDLK_DOWN:     moveProbe({0.0f, -probeStep, 0.0f}); break;
-        case SDLK_UP:       moveProbe({0.0f, +probeStep, 0.0f}); break;
-        case SDLK_PAGEDOWN: moveProbe({0.0f, 0.0f, -probeStep}); break;
-        case SDLK_PAGEUP:   moveProbe({0.0f, 0.0f, +probeStep}); break;
-        case SDLK_COMMA:
-        case SDLK_PERIOD:
-            if (m_sceneId == SceneId::AntennaArray) {
-                float& ph = m_arrayParams.phaseShiftDeg;
-                ph += (k.key == SDLK_PERIOD ? 15.0f : -15.0f);
-                if (ph > 180.0f) ph -= 360.0f;
-                if (ph < -180.0f) ph += 360.0f;
-                m_gpu->grid.setSources(scenes::antennaArraySources(m_arrayParams));
-                const double kd = glm::two_pi<double>() * m_arrayParams.spacing / m_arrayParams.wavelength;
-                const double s = -glm::radians(static_cast<double>(ph)) / kd;
-                if (std::abs(s) <= 1.0)
-                    std::printf("Phase shift %.0f deg -> main beam at %.1f deg from broadside (+x toward +y)\n", ph,
-                                glm::degrees(std::asin(s)));
-                else
-                    std::printf("Phase shift %.0f deg -> |sin(theta)| > 1: no propagating main beam\n", ph);
-            }
-            break;
-        case SDLK_G:
-            if (m_sceneId == SceneId::FaradayCage) {
-                m_cageParams.withCage = !m_cageParams.withCage;
-                loadScene(SceneId::FaradayCage, false);
-            }
-            break;
-        case SDLK_T:
-            if (m_sceneId == SceneId::Dipole) {
-                m_dipoleParams.pulsed = !m_dipoleParams.pulsed;
-                loadScene(SceneId::Dipole, false);
-            }
-            break;
-        case SDLK_P: measure(); printReport(); break;
-        case SDLK_F12: m_screenshotRequested = true; break;
-        case SDLK_F1: printHelp(); break;
+                      std::printf("Ray step: %.2f voxels\n", m_render.stepVoxels); return;
+        case SDLK_TAB: inst.selectNextProbe(); inst.measure(m_gpu->grid); inst.printReport(m_gpu->grid); return;
+        case SDLK_LEFT:     inst.moveSelectedProbe({-probeStep, 0.0f, 0.0f}, gs); return;
+        case SDLK_RIGHT:    inst.moveSelectedProbe({+probeStep, 0.0f, 0.0f}, gs); return;
+        case SDLK_DOWN:     inst.moveSelectedProbe({0.0f, -probeStep, 0.0f}, gs); return;
+        case SDLK_UP:       inst.moveSelectedProbe({0.0f, +probeStep, 0.0f}, gs); return;
+        case SDLK_PAGEDOWN: inst.moveSelectedProbe({0.0f, 0.0f, -probeStep}, gs); return;
+        case SDLK_PAGEUP:   inst.moveSelectedProbe({0.0f, 0.0f, +probeStep}, gs); return;
+        case SDLK_P:
+            inst.measure(m_gpu->grid);
+            inst.evaluateFarField(m_gpu->grid);
+            inst.printReport(m_gpu->grid);
+            return;
+        case SDLK_F12: m_screenshotRequested = true; return;
+        case SDLK_F1: printHelp(); return;
         default: break;
+    }
+
+    // Script parameters
+    if (k.key < 128) {
+        const char c = static_cast<char>(std::tolower(static_cast<int>(k.key)));
+        for (ScriptParam& p : m_params) {
+            if (p.handleKey(c)) {
+                std::printf("%s = %s\n", p.label.c_str(), p.valueString().c_str());
+                reloadWithParams();
+                return;
+            }
+        }
     }
 }
 
@@ -425,11 +579,24 @@ void Application::handleEvent(const SDL_Event& e) {
             m_fbSize = {e.window.data1, e.window.data2};
             if (m_fbSize.y > 0) m_camera.setAspect(static_cast<float>(m_fbSize.x) / static_cast<float>(m_fbSize.y));
             break;
-        case SDL_EVENT_KEY_DOWN:
-            if (!e.key.repeat || e.key.key == SDLK_LEFT || e.key.key == SDLK_RIGHT || e.key.key == SDLK_UP ||
-                e.key.key == SDLK_DOWN || e.key.key == SDLK_PAGEUP || e.key.key == SDLK_PAGEDOWN)
-                handleKey(e.key);
+        case SDL_EVENT_DROP_FILE:
+            if (e.drop.data) {
+                const fs::path p(e.drop.data);
+                if (p.extension() == ".lua") {
+                    m_sceneIndex = -1;
+                    loadScript(p, {}, true);
+                } else {
+                    std::fprintf(stderr, "Dropped file is not a .lua scene script: %s\n", e.drop.data);
+                }
+            }
             break;
+        case SDL_EVENT_KEY_DOWN: {
+            const SDL_Keycode key = e.key.key;
+            const bool repeatable = key == SDLK_LEFT || key == SDLK_RIGHT || key == SDLK_UP || key == SDLK_DOWN ||
+                                    key == SDLK_PAGEUP || key == SDLK_PAGEDOWN;
+            if (!e.key.repeat || repeatable) handleKey(e.key);
+            break;
+        }
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP: {
             const bool down = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
@@ -463,51 +630,21 @@ void Application::updateCamera(float dt) {
     m_camera.fly(d, dt, ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT]);
 }
 
-void Application::measure() {
-    SimulationGrid& grid = m_gpu->grid;
-    m_probe = m_gpu->analyzer.probe(grid, m_probePos);
-    m_probeStep = grid.stepCount();
-    m_probeTime = grid.time();
-
-    // Time-average over ~3 periods of the (first) source.
-    const double period = grid.sources().empty() ? 16.0 : grid.sources().front().wavelength;
-    m_gpu->analyzer.updateFlux(grid, m_flux, 3.0 * period);
-
-    const bool finite = std::isfinite(m_probe.E.x) && std::isfinite(m_probe.E.y) && std::isfinite(m_probe.E.z) &&
-                        std::isfinite(m_probe.B.x) && std::isfinite(m_probe.B.y) && std::isfinite(m_probe.B.z) &&
-                        std::isfinite(m_gpu->analyzer.fluxReading().instantaneous);
-    if (!finite && !m_unstable) {
-        m_unstable = true;
-        std::fprintf(stderr, "ERROR: non-finite field values detected at step %llu\n",
-                     static_cast<unsigned long long>(grid.stepCount()));
-    }
-}
-
-void Application::printReport() const {
-    const FluxReading& f = m_gpu->analyzer.fluxReading();
-    const ProbeSample& p = m_probe;
-    std::printf("[t=%8.1f step %7llu] probe (%.1f, %.1f, %.1f): |E|=%.5f E=(%+.5f %+.5f %+.5f) |B|=%.5f "
-                "S=(%+.2e %+.2e %+.2e) u=%.3e sigma=%.1f eps_r=%.2f\n",
-                m_probeTime, static_cast<unsigned long long>(m_probeStep), p.position.x,
-                p.position.y, p.position.z, p.eMagnitude(), p.E.x, p.E.y, p.E.z, p.bMagnitude(), p.S.x, p.S.y,
-                p.S.z, p.energyDensity(), p.sigma, p.epsilonR);
-    std::printf("                         flux [%s]: P=%+.4e  <P>=%+.4e  peak|P|=%.4e\n", m_flux.label.c_str(),
-                f.instantaneous, f.timeAveraged, f.peakAbs);
-}
-
+// -----------------------------------------------------------------------------
+// Reporting
+// -----------------------------------------------------------------------------
 void Application::updateTitle(double fps) {
-    const FluxReading& f = m_gpu->analyzer.fluxReading();
-    char title[512];
-    std::snprintf(title, sizeof(title),
-                  "EM_Lab | %s | t=%.0f | %.0f fps (sim %.2f ms, render %.2f ms) | %d steps/frame%s | "
-                  "probe |E|=%.4f |B|=%.4f | <P> %s = %+.3e%s",
-                  m_sceneName.c_str(), m_gpu->grid.time(), fps, m_gpu->simTimer.milliseconds(),
-                  m_gpu->renderTimer.milliseconds(), m_stepsPerFrame, m_paused ? " [PAUSED]" : "",
-                  m_probe.eMagnitude(), m_probe.bMagnitude(), m_flux.label.c_str(), f.timeAveraged,
-                  m_sceneId == SceneId::AntennaArray
-                      ? (" | dphi=" + std::to_string(static_cast<int>(m_arrayParams.phaseShiftDeg)) + " deg").c_str()
-                      : "");
-    SDL_SetWindowTitle(m_window, title);
+    std::string params;
+    for (const ScriptParam& p : m_params) params += " " + p.label + "=" + p.valueString();
+    char head[256];
+    std::snprintf(head, sizeof(head), "EM_Lab | %s%s | t=%.0f | %.0f fps (sim %.2f ms, render %.2f ms) | %d steps/frame%s",
+                  m_sceneName.c_str(), m_scriptError ? " [SCRIPT ERROR - see console]" : "", m_gpu->grid.time(), fps,
+                  m_gpu->simTimer.milliseconds(), m_gpu->renderTimer.milliseconds(), m_stepsPerFrame,
+                  m_paused ? " [PAUSED]" : "");
+    std::string title = head;
+    if (!params.empty()) title += " |" + params;
+    title += m_gpu->instruments.titleSummary();
+    SDL_SetWindowTitle(m_window, title.c_str());
 }
 
 void Application::saveScreenshot(const std::string& path) const {
@@ -529,11 +666,16 @@ void Application::saveScreenshot(const std::string& path) const {
     if (surface) SDL_DestroySurface(surface);
 }
 
+// -----------------------------------------------------------------------------
+// Main loop
+// -----------------------------------------------------------------------------
 int Application::run() {
     Uint64 last = SDL_GetPerformanceCounter();
     const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
-    double titleTimer = 0.0, reportTimer = 0.0;
+    double titleTimer = 0.0, reportTimer = 0.0, farFieldTimer = 0.0;
     int framesSinceTitle = 0;
+    SimulationGrid& grid = m_gpu->grid;
+    Instruments& inst = m_gpu->instruments;
 
     while (m_running) {
         SDL_Event e;
@@ -544,27 +686,37 @@ int Application::run() {
         last = now;
         updateCamera(std::min(dt, 0.1f));
 
+        m_hotReloadTimer += dt;
+        if (m_hotReloadTimer > 0.5) {
+            m_hotReloadTimer = 0.0;
+            checkHotReload();
+        }
+
         // ---- simulate --------------------------------------------------------
         const int steps = m_paused ? (m_singleStep ? 1 : 0) : m_stepsPerFrame;
         m_singleStep = false;
         if (steps > 0) {
             m_gpu->simTimer.begin();
-            m_gpu->grid.step(steps);
+            if (inst.hasFarField()) grid.step(steps, [&] { inst.onStep(grid); });
+            else grid.step(steps);
             m_gpu->simTimer.end();
         }
 
-        // ---- measure (readbacks are tiny but synchronous: throttle) ----------
-        if (m_frame % 2 == 0 || steps == 0) measure();
+        // ---- measure (readbacks are small but synchronous: throttle) ----------
+        if (m_frame % 2 == 0 || steps == 0) inst.measure(grid);
+        farFieldTimer += dt;
+        if (inst.hasFarField() && (farFieldTimer > 1.0 || (m_opt.frames > 0 && m_frame % 50 == 49))) {
+            farFieldTimer = 0.0;
+            inst.evaluateFarField(grid);
+        }
 
         // ---- render ----------------------------------------------------------
         m_gpu->renderTimer.begin();
-        m_gpu->renderer.render(m_camera, m_gpu->grid, m_render, m_fbSize);
+        m_gpu->renderer.render(m_camera, grid, m_render, m_fbSize);
         if (m_render.showOverlay) {
-            if (m_overlayDirty) {
-                VolumeRenderer::buildOverlay(m_overlay, m_gpu->grid.size(), m_gpu->grid.config().pmlThickness,
-                                             m_probePos, m_flux);
-                m_overlayDirty = false;
-            }
+            VolumeRenderer::buildGridOverlay(m_overlay, grid.size(), grid.config().pmlThickness);
+            VolumeRenderer::appendSources(m_overlay, grid.size(), grid.sources());
+            inst.appendOverlay(m_overlay, grid.size());
             m_gpu->renderer.drawLines(m_camera, m_overlay);
         }
         m_gpu->renderTimer.end();
@@ -591,24 +743,28 @@ int Application::run() {
             framesSinceTitle = 0;
         }
         const bool selfTest = m_opt.frames > 0;
-        if (reportTimer >= 2.0 || (selfTest && m_frame % 50 == 0)) {
-            printReport();
+        if ((!selfTest && reportTimer >= 2.0) || (selfTest && m_frame % 100 == 0)) {
+            inst.printReport(grid);
             reportTimer = 0.0;
         }
         if (selfTest && m_frame >= static_cast<std::uint64_t>(m_opt.frames)) {
-            measure();
-            printReport();
+            inst.measure(grid);
+            inst.evaluateFarField(grid);
+            inst.printReport(grid);
             std::printf("GPU timings: sim %.3f ms/frame (%d steps), render %.3f ms\n", m_gpu->simTimer.milliseconds(),
                         m_stepsPerFrame, m_gpu->renderTimer.milliseconds());
             m_running = false;
         }
     }
-    return m_unstable ? 2 : 0;
+    if (m_scriptError && m_opt.frames > 0) return 3;
+    return inst.unstable() ? 2 : 0;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
+    // Unbuffered console so stdout reports and stderr errors stay in order when piped.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     // Must run before SDL loads the OpenGL driver (Linux PRIME offload variables).
     gpu::requestHighPerformanceGpu();
     try {
