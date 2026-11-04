@@ -1,0 +1,70 @@
+{
+    "version": 8,
+    "configurePresets": [
+        {
+            "name": "MSVC",
+            "displayName": "MSVC x64",
+            "description": "Using compilers for Visual Studio (x64 architecture)",
+            "toolset": "host=x64",
+            "architecture": {
+                "value": "x64",
+                "strategy": "set"
+            },
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_CXX_COMPILER": "cl.exe",
+                "CMAKE_TOOLCHAIN_FILE": "${userHome}/source/repos/vcpkg/scripts/buildsystems/vcpkg.cmake"
+            }
+        },
+        {
+            "name": "gcc_Release",
+            "displayName": "gcc Release",
+            "description": "Using gcc with Release configuration",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_CXX_STANDARD": "17"
+            }
+        },
+        {
+            "name": "gcc_Debug",
+            "displayName": "gcc Debug",
+            "description": "Using gcc with Debug configuration",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_CXX_STANDARD": "17"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "MSVC_Release",
+            "displayName": "MSVC Release",
+            "configurePreset": "MSVC",
+            "configuration": "Release"
+        },
+        {
+            "name": "MSVC_Debug",
+            "displayName": "MSVC Debug",
+            "configurePreset": "MSVC",
+            "configuration": "Debug"
+        },
+        {
+            "name": "gcc_Release",
+            "displayName": "gcc Release",
+            "configurePreset": "gcc_Release",
+            "configuration": "Release",
+            "jobs": 4
+        },
+        {
+            "name": "gcc_Debug",
+            "displayName": "gcc Debug",
+            "configurePreset": "gcc_Debug",
+            "configuration": "Debug",
+            "jobs": 4
+        }
+    ]
+}

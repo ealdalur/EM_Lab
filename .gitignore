@@ -1,0 +1,56 @@
+# ------------------------------------------------------------------------------
+# EM_Lab: track source only (CMake files, src/, shaders/, external/glad, docs).
+# ------------------------------------------------------------------------------
+
+# Build trees (CMake binary dirs, Visual Studio "Open Folder", CLion)
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+
+# CMake artifacts from accidental in-source builds
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+_deps/
+
+# Per-user CMake presets (CMakePresets.json itself is tracked)
+CMakeUserPresets.json
+
+# vcpkg manifest-mode install tree
+vcpkg_installed/
+
+# Compiled binaries and linker/debugger by-products
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE and tooling state
+.vs/
+.vscode/
+.idea/
+.cache/
+*.user
+*.suo
+*.vcxproj*
+*.sln
+*.slnx
+
+# Screenshots written by the app (F12 / --screenshot)
+em_lab_*.bmp
+
+# OS clutter
+Thumbs.db
+desktop.ini
+.DS_Store

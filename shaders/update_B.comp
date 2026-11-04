@@ -1,0 +1,52 @@
+#version 460 core
+// =============================================================================
+// update_B.comp - Faraday's law half step:  dB/dt = -curl(E) - sigma_m * B
+//
+// Reads E (sampler, neighbours), writes B in place (each invocation touches only
+// its own texel, so read-modify-write on the image is race free).
+// sigma_m is non-zero only inside the absorbing boundary layer, where it equals
+// the electric PML conductivity (matched-impedance condition sigma_m/mu0 =
+// sigma/eps0) so that the layer is reflectionless at normal incidence.
+// =============================================================================
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(binding = 0, rgba32f) uniform restrict image3D uBField; // rgb = B, a = eps_r
+layout(binding = 1) uniform sampler3D uEField;                  // rgb = E, a = sigma
+
+// Forward-difference neighbours; E beyond the upper faces is 0 (PEC backing).
+vec3 fetchE(ivec3 p) {
+    return all(lessThan(p, uGridSize)) ? texelFetch(uEField, p, 0).xyz : vec3(0.0);
+}
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, uGridSize))) return;
+
+    vec3 e0 = texelFetch(uEField, p, 0).xyz;
+    vec3 ex = fetchE(p + ivec3(1, 0, 0));
+    vec3 ey = fetchE(p + ivec3(0, 1, 0));
+    vec3 ez = fetchE(p + ivec3(0, 0, 1));
+
+    // curl E evaluated at the B sample positions (dx = 1).
+    vec3 curlE = vec3((ey.z - e0.z) - (ez.y - e0.y),   // dEz/dy - dEy/dz  @ Bx
+                      (ez.x - e0.x) - (ex.z - e0.z),   // dEx/dz - dEz/dx  @ By
+                      (ex.y - e0.y) - (ey.x - e0.x));  // dEy/dx - dEx/dy  @ Bz
+
+    vec4 b = imageLoad(uBField, p);
+
+    vec3 bNew;
+    if (inPml(p)) {
+        vec3 pos = vec3(p);
+        vec3 sigmaM = vec3(pmlSigma(pos + vec3(0.0, 0.5, 0.5)),
+                           pmlSigma(pos + vec3(0.5, 0.0, 0.5)),
+                           pmlSigma(pos + vec3(0.5, 0.5, 0.0)));
+        vec3 x = sigmaM * uDt;                    // mu_r = 1
+        bNew = exp(-x) * b.xyz - (uDt * phi(x)) * curlE;
+    } else {
+        bNew = b.xyz - uDt * curlE;               // lossless vacuum update
+    }
+
+    imageStore(uBField, p, vec4(bNew, b.w));      // preserve eps_r in alpha
+}

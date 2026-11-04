@@ -1,0 +1,100 @@
+#version 460 core
+// =============================================================================
+// update_E.comp - Ampere-Maxwell full step with conduction and source current:
+//
+//     eps_r dE/dt = curl(B) - sigma E - J
+//
+// sigma = material conductivity (E.alpha) + graded PML conductivity.
+// The exponential integrator keeps the update exact for the loss term, so
+// sigma = 100 (metal) is perfectly stable: E decays by exp(-50) per step.
+//
+// Source injection: analytical current densities J(x,t) = p * A * w(x) * s(t),
+// where s(t) (e.g. J0 sin(wt + phi) with a smooth ramp) is evaluated per source
+// on the CPU in double precision once per step and w(x) is a soft box/Gaussian
+// spatial footprint evaluated here at every staggered E sample position.
+// =============================================================================
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(binding = 0, rgba32f) uniform restrict image3D uEField; // rgb = E, a = sigma
+layout(binding = 1) uniform sampler3D uBField;                  // rgb = B, a = eps_r
+
+struct Source {
+    vec4 centerSoft;  // xyz = centre (cell units), w = Gaussian edge softness (cells)
+    vec4 halfExtent;  // xyz = flat-top half extents (cells), w = cull radius (cells)
+    vec4 polAmp;      // xyz = unit polarisation, w = amplitude J0
+    vec4 reserved;
+};
+
+layout(std430, binding = 0) readonly restrict buffer SourceBuffer { Source uSources[]; };
+layout(std430, binding = 1) readonly restrict buffer SignalBuffer { float uSignals[]; };
+uniform int uSourceCount;
+uniform int uSignalBase;   // offset of this sub-step's signals in uSignals
+
+// Backward-difference neighbours; B below the lower faces is 0.
+vec3 fetchB(ivec3 p) {
+    return all(greaterThanEqual(p, ivec3(0))) ? texelFetch(uBField, p, 0).xyz : vec3(0.0);
+}
+
+float footprint(Source s, vec3 x) {
+    vec3 d = max(abs(x - s.centerSoft.xyz) - s.halfExtent.xyz, vec3(0.0));
+    float soft = s.centerSoft.w;
+    return exp(-dot(d, d) / (soft * soft));
+}
+
+vec3 sourceCurrent(ivec3 cell) {
+    vec3 c = vec3(cell);
+    vec3 J = vec3(0.0);
+    for (int i = 0; i < uSourceCount; ++i) {
+        float signal = uSignals[uSignalBase + i];
+        if (signal == 0.0) continue;
+        Source s = uSources[i];
+        // Conservative cull against the cell's sample span [c, c + 0.5].
+        vec3 d = abs(c + 0.25 - s.centerSoft.xyz) - s.halfExtent.xyz - 0.25;
+        if (any(greaterThan(d, vec3(s.halfExtent.w)))) continue;
+
+        vec3 w = vec3(footprint(s, c + vec3(0.5, 0.0, 0.0)),   // Jx sample
+                      footprint(s, c + vec3(0.0, 0.5, 0.0)),   // Jy sample
+                      footprint(s, c + vec3(0.0, 0.0, 0.5)));  // Jz sample
+        J += s.polAmp.xyz * (s.polAmp.w * signal) * w;
+    }
+    return J;
+}
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, uGridSize))) return;
+
+    vec4 b0 = texelFetch(uBField, p, 0);
+    vec3 bx = fetchB(p - ivec3(1, 0, 0));
+    vec3 by = fetchB(p - ivec3(0, 1, 0));
+    vec3 bz = fetchB(p - ivec3(0, 0, 1));
+
+    // curl B evaluated at the E sample positions (dx = 1).
+    vec3 curlB = vec3((b0.z - by.z) - (b0.y - bz.y),   // dBz/dy - dBy/dz  @ Ex
+                      (b0.x - bz.x) - (b0.z - bx.z),   // dBx/dz - dBz/dx  @ Ey
+                      (b0.y - bx.y) - (b0.x - by.x));  // dBy/dx - dBx/dy  @ Ez
+
+    vec4 e = imageLoad(uEField, p);
+    float sigmaMat = max(e.w, 0.0);
+    float epsR = max(b0.w, 1.0);
+
+    vec3 sigma = vec3(sigmaMat);
+    if (inPml(p)) {
+        vec3 pos = vec3(p);
+        sigma += vec3(pmlSigma(pos + vec3(0.5, 0.0, 0.0)),
+                      pmlSigma(pos + vec3(0.0, 0.5, 0.0)),
+                      pmlSigma(pos + vec3(0.0, 0.0, 0.5)));
+    }
+
+    float dtEps = uDt / epsR;
+    vec3 x  = sigma * dtEps;
+    vec3 ca = exp(-x);           // decay factor, in (0, 1]
+    vec3 cb = dtEps * phi(x);    // = (1 - ca) / sigma, -> dt/eps for sigma -> 0
+
+    vec3 J = (uSourceCount > 0) ? sourceCurrent(p) : vec3(0.0);
+
+    vec3 eNew = ca * e.xyz + cb * (curlB - J);
+    imageStore(uEField, p, vec4(eNew, e.w));      // preserve sigma in alpha
+}
