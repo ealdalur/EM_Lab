@@ -1,6 +1,7 @@
 -- Pyramidal horn antenna
--- A rectangular waveguide (TE10 mode, fed by a probe a quarter guide-wavelength in front
--- of the shorted back wall) flares into a horn. The large aperture forms a narrow beam:
+-- A rectangular waveguide (TE10 mode, fed by a coax-style probe: a short metal monopole
+-- rising from the bottom wall a quarter guide-wavelength in front of the shorted back wall)
+-- flares into a horn. The large aperture forms a narrow beam:
 -- directivity ~ e_ap * 4 pi A B / lambda^2 with aperture efficiency e_ap ~ 0.5.
 --
 -- The horn is built procedurally with shape{}: a point is metal if it lies within
@@ -43,9 +44,11 @@ shape {
   inside = horn_wall, material = "pec",
 }
 
--- TE10 guide wavelength; feed probe lambda_g / 4 in front of the short.
+-- TE10 guide wavelength; the probe stands lambda_g / 4 in front of the short, on the inner
+-- surface of the bottom wall (z = cz - b/2 rounded to the lattice), reaching half-way up.
 local lambda_g = lambda / math.sqrt(1 - (lambda / (2 * a)) ^ 2)
-dipole { center = vec(x0 - Lg + t + lambda_g / 4, cy, cz), orientation = "z", length = b - 2, amplitude = 3 }
+local floor_z  = math.floor(cz - b / 2 + 0.5)
+monopole { base = vec(x0 - Lg + t + lambda_g / 4, cy, floor_z), orientation = "+z", length = 4, amplitude = 1 }   -- thin-wire probe, 50-ohm feed
 
 probe     { position = vec(x0 + flare + 30, cy, cz), name = "boresight" }
 far_field {}

@@ -7,6 +7,11 @@
 // sigma_m is non-zero only inside the absorbing boundary layer, where it equals
 // the electric PML conductivity (matched-impedance condition sigma_m/mu0 =
 // sigma/eps0) so that the layer is reflectionless at normal incidence.
+//
+// Thin wires (Umashankar-Taflove sub-cell model): near a wire of radius a << dx the
+// fields vary as 1/r, which the grid cannot resolve. Integrating Faraday's law over the
+// cell with that radial profile multiplies the axial-E term in the update of each B
+// component circling the wire by 2 / ln(dx / a) (1 for the plain-grid radius 0.135 dx).
 // =============================================================================
 #include "common.glsl"
 
@@ -14,6 +19,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
 
 layout(binding = 0, rgba32f) uniform restrict image3D uBField; // rgb = B, a = eps_r
 layout(binding = 1) uniform sampler3D uEField;                  // rgb = E, a = sigma
+// Packed half floats per B component: x = (Bx term0, Bx term1), y = By, z = Bz.
+layout(binding = 2) uniform usampler3D uWireCoef;
+uniform int uThinWires; // 1 when the scene has thin wires (uWireCoef is full size)
 
 // Forward-difference neighbours; E beyond the upper faces is 0 (PEC backing).
 vec3 fetchE(ivec3 p) {
@@ -29,10 +37,20 @@ void main() {
     vec3 ey = fetchE(p + ivec3(0, 1, 0));
     vec3 ez = fetchE(p + ivec3(0, 0, 1));
 
-    // curl E evaluated at the B sample positions (dx = 1).
-    vec3 curlE = vec3((ey.z - e0.z) - (ez.y - e0.y),   // dEz/dy - dEy/dz  @ Bx
-                      (ez.x - e0.x) - (ex.z - e0.z),   // dEx/dz - dEz/dx  @ By
-                      (ex.y - e0.y) - (ey.x - e0.x));  // dEy/dx - dEx/dy  @ Bz
+    // curl E evaluated at the B sample positions (dx = 1): curl = term0 - term1.
+    vec3 term0 = vec3(ey.z - e0.z,    // dEz/dy  @ Bx
+                      ez.x - e0.x,    // dEx/dz  @ By
+                      ex.y - e0.y);   // dEy/dx  @ Bz
+    vec3 term1 = vec3(ez.y - e0.y,    // dEy/dz  @ Bx
+                      ex.z - e0.z,    // dEz/dx  @ By
+                      ey.x - e0.x);   // dEx/dy  @ Bz
+    if (uThinWires != 0) {
+        uvec4 w = texelFetch(uWireCoef, p, 0);
+        vec2 wx = unpackHalf2x16(w.x), wy = unpackHalf2x16(w.y), wz = unpackHalf2x16(w.z);
+        term0 *= vec3(wx.x, wy.x, wz.x);
+        term1 *= vec3(wx.y, wy.y, wz.y);
+    }
+    vec3 curlE = term0 - term1;
 
     vec4 b = imageLoad(uBField, p);
 

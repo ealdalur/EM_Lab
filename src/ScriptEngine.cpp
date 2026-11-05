@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -24,6 +25,7 @@ namespace {
 constexpr double kC0 = 299792458.0;     // m/s
 constexpr double kEta0 = 376.730313668; // free-space impedance, ohm
 constexpr double kTimeLimitSeconds = 30.0;
+constexpr float kEta0f = 376.730313668f;
 
 // =============================================================================
 // Small utilities
@@ -98,6 +100,22 @@ struct SceneSettings {
     std::string outputDir;
 };
 
+struct MonopoleCheck {
+    bool thin = true;
+    glm::ivec3 node{0};   // thin: base lattice node; rod: the cell across the gap from the rod
+    int axis = 2;
+    float sign = 1.0f;
+    std::string where;
+};
+
+struct ThinWireSpec {
+    glm::ivec3 node{0};  // lattice line (the coordinate along `axis` is ignored)
+    int axis = 2;
+    int i0 = 0, i1 = 0;  // requested edges [i0, i1) along the axis
+    float radius = 0.05f;
+    int gapEdge = INT_MIN;
+};
+
 struct Context {
     fs::path script;
     std::map<std::string, std::string> overrides;
@@ -111,6 +129,9 @@ struct Context {
     std::map<std::string, float> usedDielectrics; // name -> eps_r (resolution checks)
     std::chrono::steady_clock::time_point start;
     int sheetSources = 0;
+    // Monopole feeds must touch a conductor at their base (checked once the scene is built).
+    std::vector<MonopoleCheck> monopoles;
+    std::vector<ThinWireSpec> thinWires;
 };
 
 thread_local Context* g_ctx = nullptr;
@@ -1046,8 +1067,186 @@ int wireAxis(const Args& a, const glm::vec3& dir) {
     return ax;
 }
 
+// -----------------------------------------------------------------------------
+// Antennas: conductors + feeds.
+//
+// Conductor models:
+//   "thin"    (default) thin wire of a given radius on a line of Yee edges, using the
+//             Umashankar-Taflove sub-cell model: the wire's edges are perfect conductors
+//             and the four B components circling each edge get the factor 2 / ln(dx / a).
+//   "rod"     solid 1 x 1-cell metal conductor (voxels), electrically a fat wire.
+//   "current" ideal impressed current (no metal), for theory checks.
+// Feeds (thin / rod): a resistive voltage source (default) or an ideal current source in
+// a one-edge (thin) or one-cell (rod) gap. Every feed is also a measurement port.
+// -----------------------------------------------------------------------------
+enum class Conductor { Thin, Rod, Current };
+
+Conductor readConductor(const Args& a) {
+    const std::string m = lower(a.str("model", "thin"));
+    if (m == "thin" || m == "wire") return Conductor::Thin;
+    if (m == "rod") return Conductor::Rod;
+    if (m == "current" || m == "ideal") return Conductor::Current;
+    a.fail("model must be \"thin\" (thin wire, default), \"rod\" (1x1-cell metal conductor) or \"current\" "
+           "(ideal uniform current)");
+}
+
+struct FeedSpec {
+    bool voltage = true;
+    float impedanceOhm = 50.0f;
+    float drive = 1.0f; // peak EMF (voltage) or peak current (current), normalized
+};
+
+FeedSpec readFeed(const Args& a) {
+    FeedSpec f;
+    const std::string kind = lower(a.str("feed", "voltage"));
+    if (kind == "voltage") f.voltage = true;
+    else if (kind == "current") f.voltage = false;
+    else a.fail("feed must be \"voltage\" (resistive voltage source, default) or \"current\" (ideal current source)");
+    f.impedanceOhm = static_cast<float>(a.positive("impedance", 50.0));
+    if (!f.voltage && a.has("impedance")) warn(a.L(), a.what() + ": 'impedance' only applies to feed = \"voltage\"");
+    f.drive = static_cast<float>(a.num("amplitude", 1.0));
+    return f;
+}
+
+// Thin-wire radius in cells (default lambda / 400, a typical thin antenna wire).
+float readRadius(const Args& a, float wavelength) {
+    const float r = static_cast<float>(a.num("radius", wavelength / 400.0));
+    if (!(r > 0.0f)) a.fail("radius must be > 0");
+    if (r > 0.4f)
+        a.fail("radius %.2f cells is too thick for the thin-wire model (max 0.4 cells); use model = \"rod\" for "
+               "a 1x1-cell conductor or refine the grid", r);
+    return r;
+}
+
+glm::ivec3 cellOf(const glm::vec3& p) { return glm::ivec3(glm::floor(p)); }
+glm::ivec3 nodeOf(const glm::vec3& p) { return glm::ivec3(glm::round(p)); }
+
+// 1x1-cell rod through `cell` (transverse position) covering cells [from, to) along `axis`.
+size_t fillRod(lua_State* L, const glm::ivec3& cell, int axis, int from, int to, const Material& m) {
+    if (to <= from) return 0;
+    glm::vec3 lo(cell), hi = glm::vec3(cell) + 1.0f;
+    lo[axis] = static_cast<float>(from);
+    hi[axis] = static_cast<float>(to);
+    return builder(L).box(lo, hi, m);
+}
+
+// Thin wire along `axis` on the lattice line through `node` (its other two coordinates),
+// covering the edges [i0, i1). Edge `gapEdge` is left for a feed. Recorded here and emitted
+// by emitThinWires() once the whole scene is known (free ends get the end correction).
+void addThinWire(lua_State* L, glm::ivec3 node, int axis, int i0, int i1, float radius, int gapEdge = INT_MIN) {
+    if (i1 <= i0) return;
+    ThinWireSpec w;
+    w.node = node;
+    w.axis = axis;
+    w.i0 = i0;
+    w.i1 = i1;
+    w.radius = radius;
+    w.gapEdge = gapEdge;
+    ctx().thinWires.push_back(w);
+
+    WireSegment seg; // drawn at the requested (electrical) length
+    seg.a = glm::vec3(node);
+    seg.b = glm::vec3(node);
+    seg.a[axis] = static_cast<float>(i0);
+    seg.b[axis] = static_cast<float>(i1);
+    seg.radius = radius;
+    builder(L).env().wires.push_back(seg);
+}
+
+// Feed + port. Thin wires: the single gap edge owned by `texel`. Rods: the four corner
+// edges of gap cell `texel`, which carry the rod's current.
+void addFeed(lua_State* L, const SourceDesc& wave, const glm::ivec3& texel, int axis, float sign, int edges,
+             const FeedSpec& feed, const std::string& name) {
+    Environment& env = builder(L).env();
+    const int u = (axis + 1) % 3, v = (axis + 2) % 3;
+    glm::ivec3 eu(0), ev(0);
+    eu[u] = 1;
+    ev[v] = 1;
+
+    SourceDesc s = wave;
+    s.softness = glm::vec3(0.25f);
+    s.polarization = glm::vec3(0.0f);
+    s.polarization[axis] = sign;
+    if (edges == 4) {
+        s.center = glm::vec3(texel) + 0.5f;
+        s.halfExtent = glm::vec3(0.5f);
+        s.halfExtent[axis] = 0.0f;
+    } else {
+        s.center = glm::vec3(texel);
+        s.center[axis] += 0.5f;
+        s.halfExtent = glm::vec3(0.0f);
+    }
+
+    if (feed.voltage) {
+        // Resistive voltage source (EMF V_s behind R_s) as its Norton equivalent: each of the
+        // `edges` parallel gap edges gets conductance 1 / (edges R_s) and an impressed
+        // current -V_s / (edges R_s), so the open-circuit gap voltage is V_s.
+        const float sigma = kEta0f / (static_cast<float>(edges) * feed.impedanceOhm);
+        const glm::ivec3 offs[4] = {glm::ivec3(0), eu, ev, eu + ev};
+        for (int i = 0; i < edges; ++i) env.subcell.edges.push_back({texel + offs[i], axis, sigma});
+        s.amplitude = -sigma * feed.drive;
+    } else {
+        s.amplitude = feed.drive / static_cast<float>(edges);
+    }
+    addSource(L, s);
+
+    PortSetup p;
+    p.name = name;
+    p.texel = texel;
+    p.axis = axis;
+    p.sign = sign;
+    p.edges = edges;
+    p.wavelength = wave.wavelength;
+    p.voltageFeed = feed.voltage;
+    p.impedanceOhm = feed.impedanceOhm;
+    p.drive = feed.drive;
+    env.ports.push_back(p);
+}
+
+// Arms for a requested total length (2 * arm + 1 gap); warns when rounding is visible.
+int dipoleArm(const Args& a, float length) {
+    if (length < 3.0f)
+        a.fail("a dipole needs length >= 3 cells (two arms plus the feed gap); use model = \"current\" for shorter "
+               "ideal elements, or length = 0 for an ideal point dipole");
+    if (length < 5.0f && lower(a.str("model", "thin")) != "rod")
+        a.fail("a thin-wire dipole needs length >= 5 cells (each free end is built one cell short to correct the "
+               "grid's end effect); refine the grid, or use model = \"rod\"");
+    const int arm = std::max(1, static_cast<int>(std::lround((length - 1.0f) * 0.5f)));
+    const int realized = 2 * arm + 1;
+    if (std::abs(static_cast<float>(realized) - length) >= 1.0f)
+        warn(a.L(), fmt("%s: length %.1f realised as %d cells (two %d-cell arms + 1-cell feed gap)",
+                        a.what().c_str(), length, realized, arm));
+    return arm;
+}
+
+// Centre-fed dipole along `axis` around point `c` (feed gap at floor(c) along the axis).
+void buildDipole(lua_State* L, const Args& a, Conductor model, const SourceDesc& wave, const glm::vec3& c,
+                 int axis, float sign, int arm, float radius, const Material& metal, const FeedSpec& feed,
+                 const std::string& name) {
+    if (model == Conductor::Thin) {
+        glm::ivec3 node = nodeOf(c);
+        node[axis] = static_cast<int>(std::floor(c[axis]));
+        const int g = node[axis];
+        addThinWire(L, node, axis, g - arm, g + 1 + arm, radius, g);
+        addFeed(L, wave, node, axis, sign, 1, feed, name);
+    } else {
+        const glm::ivec3 g = cellOf(c);
+        fillRod(L, g, axis, g[axis] - arm, g[axis], metal);
+        fillRod(L, g, axis, g[axis] + 1, g[axis] + 1 + arm, metal);
+        addFeed(L, wave, g, axis, sign, 4, feed, name);
+    }
+    (void)a;
+}
+
+void copyTiming(SourceDesc& d, const SourceDesc& s) {
+    d.wavelength = s.wavelength; d.phase = s.phase; d.waveform = s.waveform; d.rampPeriods = s.rampPeriods;
+    d.repeatPeriods = s.repeatPeriods; d.delayPeriods = s.delayPeriods; d.enabled = s.enabled;
+}
+
+#define ANTENNA_KEYS "model", "radius", "feed", "impedance", "material"
+
 int api_dipole(lua_State* L) {
-    Args a(L, "dipole", {"center", "orientation", "length", "amplitude", "name", WAVEFORM_KEYS});
+    Args a(L, "dipole", {"center", "orientation", "length", "amplitude", "name", ANTENNA_KEYS, WAVEFORM_KEYS});
     lock(L);
     SourceDesc s;
     readWaveform(a, s);
@@ -1055,26 +1254,152 @@ int api_dipole(lua_State* L) {
     const glm::vec3 o = a.optDirection("orientation").value_or(glm::vec3(0, 0, 1));
     const float len = static_cast<float>(a.num("length", 0.0));
     if (len < 0.0f) a.fail("length must be >= 0");
-    if (len > 0.0f) wireAxis(a, o);
-    SourceDesc d = SourceDesc::dipole(c, o, s.wavelength, static_cast<float>(a.num("amplitude", 1.0)), len);
-    d.phase = s.phase; d.waveform = s.waveform; d.rampPeriods = s.rampPeriods;
-    d.repeatPeriods = s.repeatPeriods; d.delayPeriods = s.delayPeriods; d.enabled = s.enabled;
-    addSource(L, d);
+    const Conductor model = len > 0.0f ? readConductor(a) : Conductor::Current;
+
+    if (model != Conductor::Current) {
+        const int ax = wireAxis(a, o);
+        const float radius = model == Conductor::Thin ? readRadius(a, s.wavelength) : 0.0f;
+        const Material metal = model == Conductor::Rod ? readMaterial(a, "metal") : Material::vacuum();
+        if (model == Conductor::Thin && a.has("material")) warn(L, "dipole: thin wires are perfect conductors; 'material' applies to model = \"rod\"");
+        buildDipole(L, a, model, s, c, ax, o[ax] >= 0.0f ? 1.0f : -1.0f, dipoleArm(a, len), radius, metal,
+                    readFeed(a), a.str("name", "dipole"));
+    } else {
+        // Ideal current element: uniform current along `length`, or a point (Hertzian) dipole.
+        if (len > 0.0f) wireAxis(a, o);
+        for (const char* k : {"radius", "feed", "impedance", "material"})
+            if (a.has(k)) warn(L, fmt("dipole: '%s' does not apply to an ideal current element", k));
+        SourceDesc d = SourceDesc::dipole(c, o, s.wavelength, static_cast<float>(a.num("amplitude", 1.0)), len);
+        copyTiming(d, s);
+        addSource(L, d);
+    }
+    a.checkUnknown();
+    return 0;
+}
+
+int api_monopole(lua_State* L) {
+    Args a(L, "monopole", {"base", "orientation", "length", "amplitude", "name", ANTENNA_KEYS, WAVEFORM_KEYS});
+    lock(L);
+    SourceDesc s;
+    readWaveform(a, s);
+    const glm::vec3 base = a.reqVec("base");
+    const glm::vec3 o = a.optDirection("orientation").value_or(glm::vec3(0, 0, 1));
+    const int ax = wireAxis(a, o);
+    const float sign = o[ax] >= 0.0f ? 1.0f : -1.0f;
+    const float len = static_cast<float>(a.positive("length", 0.25 * s.wavelength));
+    if (len < 2.0f) a.fail("length must be >= 2 cells (feed gap plus rod)");
+    if (len < 3.0f && lower(a.str("model", "thin")) != "rod")
+        a.fail("a thin-wire monopole needs length >= 3 cells (its free end is built one cell short to correct the "
+               "grid's end effect)");
+    const int rod = std::max(1, static_cast<int>(std::lround(len)) - 1);
+    if (std::abs(static_cast<float>(rod + 1) - len) >= 1.0f)
+        warn(L, fmt("monopole: length %.1f realised as %d cells (1-cell feed gap + %d-cell conductor)", len, rod + 1, rod));
+    const Conductor model = readConductor(a);
+    if (model == Conductor::Current) a.fail("a monopole needs a conductor: use model = \"thin\" or \"rod\"");
+    const FeedSpec feed = readFeed(a);
+    const std::string name = a.str("name", "monopole");
+
+    // `base` is a lattice point on the conducting surface; the gap starts there.
+    const int surface = static_cast<int>(std::lround(base[ax]));
+    const int g = sign > 0.0f ? surface : surface - 1;
+    MonopoleCheck check;
+    check.axis = ax;
+    check.sign = sign;
+    check.where = where(L);
+    if (model == Conductor::Thin) {
+        glm::ivec3 node = nodeOf(base);
+        node[ax] = g;
+        if (sign > 0.0f) addThinWire(L, node, ax, g, g + 1 + rod, readRadius(a, s.wavelength), g);
+        else addThinWire(L, node, ax, g - rod, g + 1, readRadius(a, s.wavelength), g);
+        addFeed(L, s, node, ax, sign, 1, feed, name);
+        check.thin = true;
+        check.node = node;
+        check.node[ax] = surface;
+    } else {
+        glm::ivec3 cell = cellOf(base);
+        cell[ax] = g;
+        const Material m = readMaterial(a, "metal");
+        if (sign > 0.0f) fillRod(L, cell, ax, g + 1, g + 1 + rod, m);
+        else fillRod(L, cell, ax, g - rod, g, m);
+        addFeed(L, s, cell, ax, sign, 4, feed, name);
+        check.thin = false;
+        check.node = cell;
+        check.node[ax] -= static_cast<int>(sign); // the cell across the gap from the rod
+    }
+    ctx().monopoles.push_back(check);
+    a.checkUnknown();
+    return 0;
+}
+
+int api_wire(lua_State* L) {
+    Args a(L, "wire", {"from", "to", "radius", "name"});
+    lock(L);
+    const glm::ivec3 p0 = nodeOf(a.reqVec("from")), p1 = nodeOf(a.reqVec("to"));
+    const glm::ivec3 d = p1 - p0;
+    const int nonzero = (d.x != 0) + (d.y != 0) + (d.z != 0);
+    if (nonzero != 1)
+        a.fail("from and to must differ along exactly one axis (thin wires run along x, y or z); build bent or "
+               "slanted conductors from several wires or from metal shapes");
+    const int ax = d.x != 0 ? 0 : (d.y != 0 ? 1 : 2);
+    addThinWire(L, p0, ax, std::min(p0[ax], p1[ax]), std::max(p0[ax], p1[ax]),
+                readRadius(a, ctx().settings.wavelength));
     a.checkUnknown();
     return 0;
 }
 
 int api_loop(lua_State* L) {
-    Args a(L, "loop", {"center", "normal", "size", "amplitude", "name", WAVEFORM_KEYS});
+    Args a(L, "loop", {"center", "normal", "size", "amplitude", "name", ANTENNA_KEYS, WAVEFORM_KEYS});
     lock(L);
     SourceDesc base;
     readWaveform(a, base);
     const glm::vec3 c = a.vec("center", glm::vec3(ctx().settings.size) * 0.5f);
     const int n = a.axis("normal", 2);
     const float side = static_cast<float>(a.positive("size", 4.0));
-    const float I = static_cast<float>(a.num("amplitude", 1.0));
     const int u = (n + 1) % 3, v = (n + 2) % 3; // u x v = n (right-handed)
-    // Counter-clockwise current about +normal: four straight segments.
+    const Conductor model = readConductor(a);
+    const std::string name = a.str("name", "loop");
+
+    if (model == Conductor::Thin) {
+        // Square thin-wire loop, `s` cells per side, fed across one edge in the middle of the
+        // -v side (current counter-clockwise about +normal).
+        const int s = static_cast<int>(std::lround(side));
+        if (s < 2) a.fail("a thin-wire loop needs size >= 2 cells");
+        const float radius = readRadius(a, base.wavelength);
+        const glm::ivec3 n0 = nodeOf(c);
+        const int u0 = n0[u] - s / 2, v0 = n0[v] - s / 2, ug = u0 + s / 2;
+        glm::ivec3 bottom = n0, top = n0, left = n0, right = n0;
+        bottom[v] = v0; top[v] = v0 + s; left[u] = u0; right[u] = u0 + s;
+        addThinWire(L, bottom, u, u0, u0 + s, radius, ug);
+        addThinWire(L, top, u, u0, u0 + s, radius);
+        addThinWire(L, left, v, v0, v0 + s, radius);
+        addThinWire(L, right, v, v0, v0 + s, radius);
+        glm::ivec3 gap = bottom;
+        gap[u] = ug;
+        addFeed(L, base, gap, u, 1.0f, 1, readFeed(a), name);
+        a.checkUnknown();
+        return 0;
+    }
+    if (model == Conductor::Rod) {
+        // Square ring of 1x1-cell metal rods, outer size `s` cells, fed in the middle of the -v side.
+        const int s = static_cast<int>(std::lround(side));
+        if (s < 3) a.fail("a rod loop needs size >= 3 cells");
+        const Material m = readMaterial(a, "metal");
+        const glm::ivec3 g0 = cellOf(c);
+        const int u0 = g0[u] - s / 2, v0 = g0[v] - s / 2, ug = u0 + s / 2;
+        glm::ivec3 bottom = g0, top = g0, left = g0, right = g0;
+        bottom[v] = v0; top[v] = v0 + s - 1; left[u] = u0; right[u] = u0 + s - 1;
+        fillRod(L, bottom, u, u0, ug, m);
+        fillRod(L, bottom, u, ug + 1, u0 + s, m);
+        fillRod(L, top, u, u0, u0 + s, m);
+        fillRod(L, left, v, v0 + 1, v0 + s - 1, m);
+        fillRod(L, right, v, v0 + 1, v0 + s - 1, m);
+        glm::ivec3 gap = bottom;
+        gap[u] = ug;
+        addFeed(L, base, gap, u, 1.0f, 4, readFeed(a), name);
+        a.checkUnknown();
+        return 0;
+    }
+    // Ideal: four straight current segments, counter-clockwise about +normal.
+    const float I = static_cast<float>(a.num("amplitude", 1.0));
     const struct { int along; int at; float atSign; float dirSign; } seg[4] = {
         {u, v, -1.0f, +1.0f}, {v, u, +1.0f, +1.0f}, {u, v, +1.0f, -1.0f}, {v, u, -1.0f, -1.0f}};
     for (const auto& sg : seg) {
@@ -1082,8 +1407,7 @@ int api_loop(lua_State* L) {
         center[sg.at] += sg.atSign * 0.5f * side;
         axisVec[sg.along] = sg.dirSign;
         SourceDesc d = SourceDesc::dipole(center, axisVec, base.wavelength, I, side);
-        d.phase = base.phase; d.waveform = base.waveform; d.rampPeriods = base.rampPeriods;
-        d.repeatPeriods = base.repeatPeriods; d.delayPeriods = base.delayPeriods; d.enabled = base.enabled;
+        copyTiming(d, base);
         addSource(L, d);
     }
     a.checkUnknown();
@@ -1193,7 +1517,7 @@ std::vector<float> taperWeights(const Args& a, lua_State* L, int n) {
 
 int api_array(lua_State* L) {
     Args a(L, "array", {"center", "elements", "axis", "spacing", "orientation", "length", "amplitude", "phase_step",
-                        "steer", "taper", "name", WAVEFORM_KEYS});
+                        "steer", "taper", "name", ANTENNA_KEYS, WAVEFORM_KEYS});
     lock(L);
     SourceDesc base;
     readWaveform(a, base);
@@ -1263,8 +1587,16 @@ int api_array(lua_State* L) {
     if (n[0] * n[1] > SimulationGrid::kMaxSources) a.fail("too many elements (max %d)", SimulationGrid::kMaxSources);
 
     const glm::vec3 o = a.optDirection("orientation").value_or(glm::vec3(0, 0, 1));
-    const float len = static_cast<float>(a.num("length", 0.5 * base.wavelength));
-    if (len > 0.0f) wireAxis(a, o);
+    const float len = static_cast<float>(a.num("length", 0.45 * base.wavelength));
+    if (len < 0.0f) a.fail("length must be >= 0");
+    const int elemAxis = len > 0.0f ? wireAxis(a, o) : 2;
+    const Conductor model = len > 0.0f ? readConductor(a) : Conductor::Current;
+    const bool wire = model != Conductor::Current;
+    const int arm = wire ? dipoleArm(a, len) : 0;
+    const Material metal = model == Conductor::Rod ? readMaterial(a, "metal") : Material::vacuum();
+    const float radius = model == Conductor::Thin ? readRadius(a, base.wavelength) : 0.0f;
+    const FeedSpec feed = wire ? readFeed(a) : FeedSpec{};
+    const std::string baseName = a.str("name", "array");
     const float I = static_cast<float>(a.num("amplitude", 1.0));
     const std::vector<float> w0 = taperWeights(a, L, n[0]);
     const std::vector<float> w1 = dims == 2 ? taperWeights(a, L, n[1]) : std::vector<float>{1.0f};
@@ -1274,12 +1606,22 @@ int api_array(lua_State* L) {
             glm::vec3 p = c;
             p[ax[0]] += (static_cast<float>(i) - 0.5f * static_cast<float>(n[0] - 1)) * d[0];
             if (dims == 2) p[ax[1]] += (static_cast<float>(j) - 0.5f * static_cast<float>(n[1] - 1)) * d[1];
-            SourceDesc e = SourceDesc::dipole(p, o, base.wavelength, I * w0[static_cast<size_t>(i)] *
-                                                                         w1[static_cast<size_t>(dims == 2 ? j : 0)], len);
-            e.phase = base.phase + static_cast<float>(i) * dphi[0] + static_cast<float>(j) * dphi[1];
-            e.waveform = base.waveform; e.rampPeriods = base.rampPeriods; e.repeatPeriods = base.repeatPeriods;
-            e.delayPeriods = base.delayPeriods; e.enabled = base.enabled;
-            if (e.amplitude != 0.0f) addSource(L, e);
+            const float current = I * w0[static_cast<size_t>(i)] * w1[static_cast<size_t>(dims == 2 ? j : 0)];
+            SourceDesc timing = base;
+            timing.phase = base.phase + static_cast<float>(i) * dphi[0] + static_cast<float>(j) * dphi[1];
+            if (wire) {
+                // Elements stay in place even when undriven (tapered to 0): they still couple.
+                FeedSpec ef = feed;
+                ef.drive = current;
+                const std::string ename = dims == 2 ? fmt("%s[%d,%d]", baseName.c_str(), i, j)
+                                                    : fmt("%s[%d]", baseName.c_str(), i);
+                buildDipole(L, a, model, timing, p, elemAxis, o[elemAxis] >= 0.0f ? 1.0f : -1.0f, arm, radius, metal,
+                            ef, ename);
+            } else if (current != 0.0f) {
+                SourceDesc e = SourceDesc::dipole(p, o, base.wavelength, current, len);
+                copyTiming(e, timing);
+                addSource(L, e);
+            }
         }
     a.checkUnknown();
     return 0;
@@ -1479,6 +1821,7 @@ void registerApi(lua_State* L) {
         {"grating", wrap<api_grating>},     {"cage", wrap<api_cage>},
         {"frame", wrap<api_frame>},         {"shape", wrap<api_shape>},
         {"dipole", wrap<api_dipole>},       {"loop", wrap<api_loop>},
+        {"monopole", wrap<api_monopole>},  {"wire", wrap<api_wire>},
         {"plane_wave", wrap<api_plane_wave>}, {"gaussian_beam", wrap<api_gaussian_beam>},
         {"array", wrap<api_array>},         {"current_source", wrap<api_current_source>},
         {"probe", wrap<api_probe>},         {"flux_plane", wrap<api_flux_plane>},
@@ -1519,6 +1862,67 @@ void openSandboxedLibs(lua_State* L, const fs::path& scriptDir) {
     lua_pop(L, 2);
 }
 
+// Emits the thin wires into the sub-cell model. End correction: the lattice node at a free
+// wire end holds more charge than the tip of a real thin wire, which makes the wire act
+// about one cell longer per free end (measured: impedance and radiation resistance of
+// dipoles match thin-wire theory when 2 cells are added). Each free end is therefore
+// built one cell short, so the electrical length equals the requested length. Ends that
+// touch another conductor (another wire, metal cells) are not free.
+void emitThinWires(Context& c) {
+    Environment& env = c.builder->env();
+    auto key = [](const glm::ivec3& p) {
+        return (static_cast<long long>(p.x + 4096) << 26) | (static_cast<long long>(p.y + 4096) << 13) |
+               static_cast<long long>(p.z + 4096);
+    };
+    // Lattice nodes on each wire, to detect wires touching other wires.
+    std::vector<std::set<long long>> nodes(c.thinWires.size());
+    for (size_t w = 0; w < c.thinWires.size(); ++w) {
+        const ThinWireSpec& t = c.thinWires[w];
+        for (int k = t.i0; k <= t.i1; ++k) {
+            glm::ivec3 p = t.node;
+            p[t.axis] = k;
+            nodes[w].insert(key(p));
+        }
+    }
+    auto touchesConductor = [&](size_t self, const glm::ivec3& p) {
+        for (size_t w = 0; w < nodes.size(); ++w)
+            if (w != self && nodes[w].count(key(p))) return true;
+        for (int dz = -1; dz <= 0; ++dz)
+            for (int dy = -1; dy <= 0; ++dy)
+                for (int dx = -1; dx <= 0; ++dx)
+                    if (env.materials.get(p + glm::ivec3(dx, dy, dz)).sigma >= 1.0f) return true;
+        return false;
+    };
+
+    for (size_t w = 0; w < c.thinWires.size(); ++w) {
+        ThinWireSpec t = c.thinWires[w];
+        glm::ivec3 a = t.node, b = t.node;
+        a[t.axis] = t.i0;
+        b[t.axis] = t.i1;
+        if (!touchesConductor(w, a) && t.gapEdge != t.i0) ++t.i0;
+        if (!touchesConductor(w, b) && t.gapEdge != t.i1 - 1) --t.i1;
+
+        const float f = 2.0f / std::log(1.0f / t.radius);
+        const int u = (t.axis + 1) % 3, v = (t.axis + 2) % 3;
+        glm::ivec3 eu(0), ev(0);
+        eu[u] = 1;
+        ev[v] = 1;
+        // In the update of B component c, curl_c E = term0 - term1 with term0 = d_{c+1} E_{c+2}:
+        // the term holding the wire's own (axial) E component gets the thin-wire factor.
+        const int ax = t.axis;
+        auto term = [ax](int comp) { return (comp + 2) % 3 == ax ? 0 : 1; };
+        for (int k = t.i0; k < t.i1; ++k) {
+            glm::ivec3 q = t.node;
+            q[t.axis] = k;
+            if (k != t.gapEdge) env.subcell.edges.push_back({q, t.axis, kPerfectEdgeSigma});
+            env.subcell.wireTerms.push_back({q, u, term(u), f});       // B_u at +1/2 v
+            env.subcell.wireTerms.push_back({q - ev, u, term(u), f});  // B_u at -1/2 v
+            env.subcell.wireTerms.push_back({q, v, term(v), f});       // B_v at +1/2 u
+            env.subcell.wireTerms.push_back({q - eu, v, term(v), f});  // B_v at -1/2 u
+        }
+    }
+}
+
 void finalChecks(Context& c) {
     Environment& env = c.builder->env();
     const glm::vec3 n(env.grid.size);
@@ -1527,6 +1931,33 @@ void finalChecks(Context& c) {
         return glm::any(glm::lessThan(p, glm::vec3(L))) || glm::any(glm::greaterThanEqual(p, n - L));
     };
     if (env.sources.empty()) c.warnings.push_back("scene has no (enabled) sources: nothing will radiate");
+    for (const MonopoleCheck& m : c.monopoles) {
+        bool grounded = false;
+        if (!m.thin) {
+            grounded = env.materials.get(m.node).sigma >= 1.0f;
+        } else {
+            // A metal cell touching the base node on the ground side, or a thin wire ending there.
+            const int u = (m.axis + 1) % 3, v = (m.axis + 2) % 3;
+            for (int du = -1; du <= 0 && !grounded; ++du)
+                for (int dv = -1; dv <= 0 && !grounded; ++dv) {
+                    glm::ivec3 cell = m.node;
+                    cell[u] += du;
+                    cell[v] += dv;
+                    cell[m.axis] = m.sign > 0.0f ? m.node[m.axis] - 1 : m.node[m.axis];
+                    grounded = env.materials.get(cell).sigma >= 1.0f;
+                }
+            for (const EdgeOverride& e : env.subcell.edges) {
+                if (grounded) break;
+                if (e.sigma < 0.5f * kPerfectEdgeSigma) continue;
+                glm::ivec3 end = e.texel;
+                end[e.axis] += 1;
+                grounded = e.texel == m.node || end == m.node;
+            }
+        }
+        if (!grounded)
+            c.warnings.push_back(m.where + "monopole: no conductor touches the base of the feed gap, so the feed has "
+                                           "nothing to drive against. Add a ground plane, radials or wall at the base.");
+    }
     for (const auto& [name, eps] : c.usedDielectrics) {
         const float lambdaIn = env.referenceWavelength / std::sqrt(eps);
         if (lambdaIn < 8.0f)
@@ -1632,7 +2063,10 @@ bool ScriptParam::handleKey(char key) {
 // =============================================================================
 ScriptResult ScriptEngine::run(const fs::path& script, const std::map<std::string, std::string>& overrides) {
     std::ifstream in(script, std::ios::binary);
-    if (!in) throw ScriptError("cannot open script '" + script.string() + "'");
+    if (!in) {
+        std::error_code ec;
+        throw ScriptError("cannot open script '" + fs::absolute(script, ec).string() + "'");
+    }
     std::ostringstream ss;
     ss << in.rdbuf();
     const std::string source = ss.str();
@@ -1662,6 +2096,7 @@ ScriptResult ScriptEngine::run(const fs::path& script, const std::map<std::strin
     if (lua_pcall(L, 0, 0, handler) != LUA_OK) throw ScriptError(cleanTraceback(lua_tostring(L, -1)));
 
     lock(L); // a script without scene{} or objects still yields a valid (empty) scene
+    emitThinWires(c);
     finalChecks(c);
     c.builder->env().view = c.view;
 

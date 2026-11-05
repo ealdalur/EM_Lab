@@ -9,7 +9,11 @@
 
 namespace fs = std::filesystem;
 
-Instruments::Instruments(const fs::path& shaderDir) : m_analyzer(shaderDir), m_farField(shaderDir) {}
+namespace {
+constexpr double kEta0 = 376.730313668;
+} // namespace
+
+Instruments::Instruments(const fs::path& shaderDir) : m_analyzer(shaderDir), m_farField(shaderDir), m_ports(shaderDir) {}
 
 std::unique_ptr<std::ofstream> Instruments::openLog(const std::string& path, const char* header,
                                                     std::vector<std::string>& warnings) const {
@@ -51,6 +55,18 @@ void Instruments::configure(const SimulationGrid& grid, const Environment& env, 
         m_fluxes.push_back(std::move(flux));
     }
 
+    m_wires = env.wires;
+    m_ports.disable();
+    if (!env.ports.empty()) {
+        m_ports.configure(grid, env.ports, env.farField ? env.farField->averagingPeriods : 4.0f);
+        for (const PortSetup& p : env.ports)
+            if (std::abs(p.wavelength - env.ports.front().wavelength) > 1e-3f) {
+                warnings.push_back("ports drive different frequencies; impedances are evaluated at the first "
+                                   "port's wavelength");
+                break;
+            }
+    }
+
     m_farField.disable();
     if (env.farField) {
         try {
@@ -70,7 +86,12 @@ void Instruments::configure(const SimulationGrid& grid, const Environment& env, 
     }
 }
 
-void Instruments::onStep(const SimulationGrid& grid) { m_farField.accumulate(grid); }
+void Instruments::onStep(const SimulationGrid& grid) {
+    m_farField.accumulate(grid);
+    m_ports.accumulate(grid);
+}
+
+void Instruments::evaluatePorts() { m_ports.evaluate(); }
 
 void Instruments::resetHistory(const SimulationGrid& grid) {
     for (Flux& f : m_fluxes) {
@@ -78,6 +99,10 @@ void Instruments::resetHistory(const SimulationGrid& grid) {
         f.lastTime = -1.0;
     }
     if (m_farField.enabled()) m_farField.configure(grid, m_farField.setup());
+    if (m_ports.enabled()) {
+        const std::vector<PortSetup> ports = m_ports.ports();
+        m_ports.configure(grid, ports, m_farField.enabled() ? m_farField.setup().averagingPeriods : 4.0f);
+    }
     m_unstable = false;
 }
 
@@ -122,9 +147,63 @@ void Instruments::measure(const SimulationGrid& grid) {
 
 void Instruments::evaluateFarField(const SimulationGrid& grid) {
     if (m_farField.enabled()) m_farField.evaluate(grid);
+    m_ports.evaluate();
+}
+
+void Instruments::printAllPorts(const SimulationGrid& grid) const { printPorts(grid, m_ports.ports().size()); }
+
+void Instruments::printPorts(const SimulationGrid& grid, size_t maxLines) const {
+    if (!m_ports.enabled()) return;
+    const auto& ports = m_ports.ports();
+    const auto& rd = m_ports.readings();
+    const double periods = m_ports.accumulatedPeriods(grid);
+    double accepted = 0.0, available = 0.0;
+    for (size_t i = 0; i < ports.size(); ++i) {
+        accepted += rd[i].acceptedPower;
+        available += rd[i].availablePower;
+    }
+    if (periods < 12.0)
+        std::printf("    ports: averaging (%.0f of ~12 periods), impedances still settling\n", periods);
+    for (size_t i = 0; i < ports.size() && i < maxLines; ++i) {
+        const PortSetup& p = ports[i];
+        const PortReading& r = rd[i];
+        if (!r.valid) {
+            std::printf("    port  %-14s (no current yet)\n", p.name.c_str());
+            continue;
+        }
+        if (p.voltageFeed)
+            std::printf("    port  %-14s Z = %7.1f %+7.1fj ohm | Gamma %.3f @ %+5.0f deg (S11 %6.1f dB), VSWR %5.2f vs %.0f ohm "
+                        "| P_acc %.3e of %.3e avail (%.0f%%)\n",
+                        p.name.c_str(), r.zOhm.real(), r.zOhm.imag(), std::abs(r.gamma),
+                        std::arg(r.gamma) * 57.29577951308232, -r.returnLossDb, r.vswr, p.impedanceOhm, r.acceptedPower,
+                        r.availablePower, r.availablePower > 0.0 ? 100.0 * r.acceptedPower / r.availablePower : 0.0);
+        else
+            std::printf("    port  %-14s Z = %7.1f %+7.1fj ohm | current feed %.3g | P_acc %.3e\n", p.name.c_str(),
+                        r.zOhm.real(), r.zOhm.imag(), static_cast<double>(p.drive), r.acceptedPower);
+    }
+    if (ports.size() > maxLines)
+        std::printf("    ... %zu more ports (press P for all) | total P_acc %.3e of %.3e available\n",
+                    ports.size() - maxLines, accepted, available);
+
+    // Radiation resistance and efficiency from the far-field power.
+    if (m_farField.enabled() && m_farField.pattern().valid && accepted > 0.0) {
+        const double prad = m_farField.pattern().radiatedPower;
+        if (ports.size() == 1 && rd[0].valid) {
+            const double i2 = std::norm(rd[0].I);
+            std::printf("    radiation resistance R_rad = 2 P_rad / |I|^2 = %.1f ohm, radiation efficiency P_rad / P_acc "
+                        "= %.0f%%\n", 2.0 * prad / i2 * kEta0, 100.0 * prad / accepted);
+        } else {
+            std::printf("    radiation efficiency P_rad / total P_acc = %.0f%%\n", 100.0 * prad / accepted);
+        }
+    }
 }
 
 void Instruments::printReport(const SimulationGrid& grid) const {
+    if (empty()) {
+        std::printf("[t=%8.1f step %7llu] %s\n", grid.time(), static_cast<unsigned long long>(grid.stepCount()),
+                    kNoInstrumentsHint);
+        return;
+    }
     std::printf("[t=%8.1f step %7llu]\n", m_measureTime, static_cast<unsigned long long>(m_measureStep));
     for (size_t i = 0; i < m_probes.size(); ++i) {
         const ProbeSample& p = m_probes[i].sample;
@@ -137,6 +216,8 @@ void Instruments::printReport(const SimulationGrid& grid) const {
     for (const Flux& f : m_fluxes)
         std::printf("    flux  %-28s P=%+.4e  <P>=%+.4e  peak|P|=%.4e\n", f.setup.surface.label.c_str(),
                     f.reading.instantaneous, f.reading.timeAveraged, f.reading.peakAbs);
+
+    printPorts(grid, 4);
 
     if (m_farField.enabled()) {
         const FarFieldPattern& pat = m_farField.pattern();
@@ -178,6 +259,11 @@ std::string Instruments::titleSummary() const {
                       m_fluxes.front().reading.timeAveraged);
         s += buf;
     }
+    if (m_ports.enabled() && !m_ports.readings().empty() && m_ports.readings().front().valid) {
+        const PortReading& r = m_ports.readings().front();
+        std::snprintf(buf, sizeof(buf), " | Z=%.0f%+.0fj ohm VSWR %.2f", r.zOhm.real(), r.zOhm.imag(), r.vswr);
+        s += buf;
+    }
     if (m_farField.enabled() && m_farField.pattern().valid) {
         std::snprintf(buf, sizeof(buf), " | D_max=%.2f dBi", m_farField.pattern().maxDirectivityDbi);
         s += buf;
@@ -198,6 +284,13 @@ void Instruments::moveSelectedProbe(const glm::vec3& delta, const glm::ivec3& gr
 void Instruments::appendOverlay(std::vector<LineVertex>& out, const glm::ivec3& g) const {
     auto W = [&g](const glm::vec3& p) { return VolumeRenderer::latticeToWorld(g, p); };
     const float voxel = VolumeRenderer::worldScale(g);
+
+    // Thin wires are sub-cell conductors (not voxels): draw them as bright metal lines.
+    const glm::vec4 wireColor{0.85f, 0.88f, 0.95f, 0.95f};
+    for (const WireSegment& w : m_wires) {
+        out.push_back({W(w.a), wireColor});
+        out.push_back({W(w.b), wireColor});
+    }
 
     for (size_t i = 0; i < m_probes.size(); ++i) {
         const bool sel = i == m_selected;

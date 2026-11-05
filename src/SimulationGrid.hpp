@@ -69,6 +69,40 @@ private:
 };
 
 // -----------------------------------------------------------------------------
+// Sub-cell model: things the cell-based materials cannot express
+// -----------------------------------------------------------------------------
+// Conductivity of one Yee E edge, replacing the cell-averaged value. Used for thin-wire
+// conductors (a single line of perfectly conducting edges) and lumped feed resistors.
+struct EdgeOverride {
+    glm::ivec3 texel{0};   // owning texel: the edge E_axis sits at texel + 0.5 * e_axis
+    int axis = 0;
+    float sigma = 0.0f;    // normalized conductivity
+    bool operator==(const EdgeOverride& o) const { return texel == o.texel && axis == o.axis && sigma == o.sigma; }
+};
+
+// Thin-wire (Umashankar-Taflove) correction: multiplies one term of the curl of E in the
+// update of a B component that circles a wire. With the B component c and c1 = c+1,
+// c2 = c+2 (mod 3), curl_c E = term0 - term1, term0 = d_{c1} E_{c2}, term1 = d_{c2} E_{c1}.
+struct WireCoefficient {
+    glm::ivec3 texel{0};   // owning texel of the B component
+    int component = 0;     // 0, 1, 2 = Bx, By, Bz
+    int term = 0;          // 0 or 1 (see above)
+    float factor = 1.0f;   // 2 / ln(cell / radius)
+    bool operator==(const WireCoefficient& o) const {
+        return texel == o.texel && component == o.component && term == o.term && factor == o.factor;
+    }
+};
+
+struct SubcellModel {
+    std::vector<EdgeOverride> edges;
+    std::vector<WireCoefficient> wireTerms;
+    [[nodiscard]] bool empty() const noexcept { return edges.empty() && wireTerms.empty(); }
+    bool operator==(const SubcellModel& o) const { return edges == o.edges && wireTerms == o.wireTerms; }
+};
+
+constexpr float kPerfectEdgeSigma = 6.0e4f; // largest sigma the half-float edge texture holds: a perfect conductor
+
+// -----------------------------------------------------------------------------
 // Current-density sources  J(x,t) = polarization * amplitude * w(x) * s(t)
 // -----------------------------------------------------------------------------
 enum class Waveform : int {
@@ -127,7 +161,7 @@ public:
     void configure(const GridConfig& config);
 
     // Voxelised environment -> alpha channels. Also clears E and B and time.
-    void uploadMaterials(const MaterialVolume& materials);
+    void uploadMaterials(const MaterialVolume& materials, const SubcellModel& subcell = {});
 
     // Replaces the active sources. Does not touch the field state, so phase
     // changes (e.g. beam steering) can be applied live.
@@ -162,6 +196,9 @@ private:
     gl::Texture m_eField;
     gl::Texture m_bField;
     gl::Texture m_edgeMaterial;  // per-component (edge-averaged) sigma / eps_r, packed halves (RGBA32UI)
+    gl::Texture m_wireCoef;      // thin-wire curl-term factors for the B update, packed halves (RGBA32UI)
+    glm::ivec3 m_wireCoefSize{0};
+    bool m_hasThinWires = false;
     gl::Buffer  m_sourceBuffer;  // static per-source geometry (std430 Source[])
     gl::Buffer  m_signalBuffer;  // per-step s(t) values (std430 float[])
 

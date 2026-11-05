@@ -9,8 +9,8 @@
 scene {
   name        = "Planar Array with Ground Plane",
   description = "4x4 dipole array over a PEC reflector; 2-D beam steering with the far-field monitor.",
-  size        = {144, 160, 160},
-  wavelength  = 16,
+  size        = {160, 176, 176},
+  wavelength  = 18,            -- lambda/2 = 9 cells
 }
 
 local az     = param { name = "azimuth", label = "steer az (deg)", default = 0, min = -50, max = 50, step = 10, keys = {",", "."} }
@@ -21,8 +21,8 @@ local L = grid.wavelength
 local c = grid.center
 
 array {
-  center = c, elements = {4, 4}, axis = {"y", "z"}, spacing = {0.5 * L, 0.7 * L},
-  orientation = "z", length = 0.45 * L, amplitude = 1.5, steer = {az, el},
+  center = c, elements = {4, 4}, axis = {"y", "z"}, spacing = {9, 13},   -- 0.5 and ~0.72 lambda
+  orientation = "z", length = 9, amplitude = 1, steer = {az, el},        -- thin-wire dipoles, 50-ohm feeds
 }
 
 if ground then

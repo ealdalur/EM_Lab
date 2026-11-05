@@ -202,7 +202,7 @@ void SimulationGrid::applySolverUniforms(const Shader& s) const {
     s.set("uPmlGrading", m_config.pmlGrading);
 }
 
-void SimulationGrid::uploadMaterials(const MaterialVolume& materials) {
+void SimulationGrid::uploadMaterials(const MaterialVolume& materials, const SubcellModel& subcell) {
     if (materials.size() != m_config.size)
         throw std::runtime_error("SimulationGrid: material volume size does not match the grid");
 
@@ -228,8 +228,7 @@ void SimulationGrid::uploadMaterials(const MaterialVolume& materials) {
         x = std::max(x, 0); y = std::max(y, 0); z = std::max(z, 0);
         return (static_cast<size_t>(z) * s.y + y) * s.x + x;
     };
-    constexpr float kHalfMax = 6.0e4f; // half-float range; sigma beyond this is already a perfect conductor
-    std::vector<glm::uvec4> edge(n);
+    std::vector<glm::vec3> edgeSigma(n), edgeEps(n);
     for (int z = 0; z < s.z; ++z)
         for (int y = 0; y < s.y; ++y)
             for (int x = 0; x < s.x; ++x) {
@@ -240,13 +239,53 @@ void SimulationGrid::uploadMaterials(const MaterialVolume& materials) {
                 auto avg = [](const std::vector<float>& v, const size_t (&c)[4]) {
                     return 0.25f * (v[c[0]] + v[c[1]] + v[c[2]] + v[c[3]]);
                 };
-                const glm::vec3 sg = glm::min(glm::vec3(avg(sig, ex), avg(sig, ey), avg(sig, ez)), glm::vec3(kHalfMax));
-                const glm::vec3 ep = glm::vec3(avg(eps, ex), avg(eps, ey), avg(eps, ez));
-                edge[c00] = glm::uvec4(glm::packHalf2x16({sg.x, sg.y}), glm::packHalf2x16({sg.z, ep.x}),
-                                       glm::packHalf2x16({ep.y, ep.z}), 0u);
+                edgeSigma[c00] = glm::vec3(avg(sig, ex), avg(sig, ey), avg(sig, ez));
+                edgeEps[c00] = glm::vec3(avg(eps, ex), avg(eps, ey), avg(eps, ez));
             }
+
+    // Sub-cell overrides (thin-wire conductors, lumped feed resistors) replace the averages.
+    for (const EdgeOverride& o : subcell.edges) {
+        if (!materials.contains(o.texel) || o.axis < 0 || o.axis > 2) continue;
+        edgeSigma[materials.index(o.texel)][o.axis] = std::max(o.sigma, 0.0f);
+    }
+
+    std::vector<glm::uvec4> edge(n);
+    for (size_t i = 0; i < n; ++i) {
+        const glm::vec3 sg = glm::min(edgeSigma[i], glm::vec3(kPerfectEdgeSigma)); // half-float range
+        const glm::vec3& ep = edgeEps[i];
+        edge[i] = glm::uvec4(glm::packHalf2x16({sg.x, sg.y}), glm::packHalf2x16({sg.z, ep.x}),
+                             glm::packHalf2x16({ep.y, ep.z}), 0u);
+    }
     glTextureSubImage3D(m_edgeMaterial.get(), 0, 0, 0, 0, s.x, s.y, s.z, GL_RGBA_INTEGER, GL_UNSIGNED_INT,
                         edge.data());
+
+    // Thin-wire factors for the B update (a full-size texture only when the scene has thin wires).
+    m_hasThinWires = !subcell.wireTerms.empty();
+    const glm::ivec3 coefSize = m_hasThinWires ? s : glm::ivec3(1);
+    if (!m_wireCoef || m_wireCoefSize != coefSize) {
+        m_wireCoef = gl::createTexture(GL_TEXTURE_3D);
+        glTextureStorage3D(m_wireCoef.get(), 1, GL_RGBA32UI, coefSize.x, coefSize.y, coefSize.z);
+        glTextureParameteri(m_wireCoef.get(), GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTextureParameteri(m_wireCoef.get(), GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        m_wireCoefSize = coefSize;
+    }
+    const GLuint ones = glm::packHalf2x16({1.0f, 1.0f});
+    const GLuint coefInit[4] = {ones, ones, ones, 0u};
+    glClearTexImage(m_wireCoef.get(), 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, coefInit);
+    if (m_hasThinWires) {
+        std::vector<glm::vec2> factor(n * 3, glm::vec2(1.0f)); // [texel * 3 + component] = (term0, term1)
+        for (const WireCoefficient& w : subcell.wireTerms) {
+            if (!materials.contains(w.texel) || w.component < 0 || w.component > 2) continue;
+            factor[materials.index(w.texel) * 3 + static_cast<size_t>(w.component)][w.term == 0 ? 0 : 1] = w.factor;
+        }
+        std::vector<glm::uvec4> packed(n);
+        for (size_t i = 0; i < n; ++i)
+            packed[i] = glm::uvec4(glm::packHalf2x16(factor[i * 3 + 0]), glm::packHalf2x16(factor[i * 3 + 1]),
+                                   glm::packHalf2x16(factor[i * 3 + 2]), 0u);
+        glTextureSubImage3D(m_wireCoef.get(), 0, 0, 0, 0, s.x, s.y, s.z, GL_RGBA_INTEGER, GL_UNSIGNED_INT,
+                            packed.data());
+    }
+    m_updateB.set("uThinWires", m_hasThinWires ? 1 : 0);
 
     m_stepCount = 0;
 }
@@ -315,6 +354,7 @@ void SimulationGrid::step(int count, const std::function<void()>& afterEachStep)
         m_updateB.use();
         bindImage(0, m_bField.get());
         glBindTextureUnit(1, m_eField.get());
+        glBindTextureUnit(2, m_wireCoef.get());
         m_updateB.dispatchCovering(cells);
         glMemoryBarrier(kFieldBarrier);
 
@@ -341,6 +381,6 @@ void SimulationGrid::step(int count, const std::function<void()>& afterEachStep)
 }
 
 size_t SimulationGrid::gpuMemoryBytes() const noexcept {
-    return static_cast<size_t>(m_config.size.x) * m_config.size.y * m_config.size.z *
-           (2 * sizeof(glm::vec4) + sizeof(glm::uvec4));
+    const size_t cells = static_cast<size_t>(m_config.size.x) * m_config.size.y * m_config.size.z;
+    return cells * (2 * sizeof(glm::vec4) + sizeof(glm::uvec4)) + (m_hasThinWires ? cells * sizeof(glm::uvec4) : 0);
 }

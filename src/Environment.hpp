@@ -10,6 +10,7 @@
 
 #include "FarField.hpp"
 #include "FieldAnalyzer.hpp"
+#include "Ports.hpp"
 #include "SimulationGrid.hpp"
 
 #include <glm/glm.hpp>
@@ -142,6 +143,12 @@ struct ProbeSetup {
     std::string logPath;               // optional CSV time series
 };
 
+// A thin-wire conductor, for drawing (the solver uses Environment::subcell).
+struct WireSegment {
+    glm::vec3 a{0.0f}, b{0.0f}; // lattice-node endpoints
+    float radius = 0.05f;       // cells
+};
+
 struct FluxSetup {
     FluxSurface surface;               // surface.label is the monitor name
     std::string logPath;
@@ -158,6 +165,9 @@ struct Environment {
     std::vector<ProbeSetup> probes;
     std::vector<FluxSetup> fluxes;
     std::optional<FarFieldSetup> farField;
+    SubcellModel subcell;            // thin-wire conductors and lumped feed resistors
+    std::vector<WireSegment> wires;  // thin wires, for the overlay
+    std::vector<PortSetup> ports;    // antenna feeds: impedance, VSWR, accepted power
     ViewHints view;
 };
 

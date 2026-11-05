@@ -42,6 +42,7 @@ set(EMLAB_SOURCES
   src/FarField.cpp
   src/Instruments.cpp
   src/ScriptEngine.cpp
+  src/Ports.cpp
 )
 
 set(EMLAB_HEADERS
@@ -56,6 +57,7 @@ set(EMLAB_HEADERS
   src/FarField.hpp
   src/Instruments.hpp
   src/ScriptEngine.hpp
+  src/Ports.hpp
 )
 
 set(EMLAB_SHADERS
@@ -68,13 +70,14 @@ set(EMLAB_SHADERS
   shaders/ntff_common.glsl
   shaders/ntff_accumulate.comp
   shaders/ntff_pattern.comp
+  shaders/port_accumulate.comp
   shaders/fullscreen.vert
   shaders/raymarch.frag
   shaders/lines.vert
   shaders/lines.frag
 )
 
-file(GLOB EMLAB_SCENES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/scenes/*.lua)
+file(GLOB EMLAB_SCENES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/scenes/*.lua ${CMAKE_CURRENT_SOURCE_DIR}/scenes/validation/*.lua)
 
 
 add_executable(${PROJECT_NAME} ${EMLAB_SOURCES} ${EMLAB_HEADERS} ${EMLAB_SHADERS} ${EMLAB_SCENES})

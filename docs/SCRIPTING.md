@@ -31,7 +31,7 @@ Contents:
 |---|---|
 | Keys **1–9, 0** | Load bundled scenes 1–10 from `scenes/` (sorted by file name). **F6 / F7** step through all of them. |
 | Drag and drop a `.lua` file onto the window | Load that script. |
-| `EM_Lab --script my_scene.lua` | Load a script from the command line. `--list` prints the bundled scenes. |
+| `EM_Lab --script my_scene.lua` | Load a script from the command line. A relative path is tried in the current folder, then in `scenes/`, and `.lua` may be omitted. `--list` prints the bundled scenes. |
 | Save the file | **Hot reload.** The script is re-run automatically about 0.5 s after you save it. **F5** reloads manually. |
 | `--set name=value` | Override a `param{}` at startup. Repeat the option for several parameters. |
 
@@ -49,7 +49,7 @@ Contents:
 - **Wavelength: cells per wavelength.** `scene{ wavelength = 16 }` sets the reference wavelength. Sources, loss tangents and `wavelengths()` use it by default, and it determines accuracy (see §9).
 - **Physical scale.** `scene{ cell_size = 1e-3 }` (in metres, default 1 mm) maps cells to real units. Wherever a `wavelength` can be given, you can give `frequency` (Hz) instead, and materials can take a `conductivity` in S/m. For example, with 1 mm cells, `frequency = 10e9` means λ = 30 cells.
 - **Time.** The speed of light is c = 1 cell per time unit, and one period equals λ time units. Time-related source keys (`ramp`, `pulse_width`, `delay`, `interval`) are given **in periods**.
-- **Fields.** Normalised units with ε₀ = μ₀ = c = 1. The B channel stores c·B, so the Poynting vector is S = E × B and the wave impedance is 1.
+- **Fields.** Normalised units with ε₀ = μ₀ = c = 1. The B channel stores c·B, so the Poynting vector is S = E × B and the wave impedance is 1. To convert any input or output to SI units (V/m, A, W, seconds…), see **[UNITS.md](UNITS.md)**.
 - **Absorbing boundary.** The outer `pml` cells (default 16) absorb outgoing waves. Fields there are not physical, so keep objects and instruments out of that layer. Walls and ground planes may extend into it.
 
 The `grid` table, which is read-only, describes the active grid:
@@ -225,7 +225,7 @@ All sources share these timing keys:
 | Key | Default | Description |
 |---|---|---|
 | `wavelength` / `frequency` | scene reference | Wavelength in cells, or frequency in Hz. |
-| `amplitude` | 1 | **E-field amplitude** for `plane_wave` and `gaussian_beam`. **Peak current** for wires (`dipole`, `loop`, `array`). Raw current density J₀ for `current_source`. |
+| `amplitude` | 1 | **E-field amplitude** for `plane_wave` and `gaussian_beam`. For antennas (`dipole`, `monopole`, `loop`, `array` elements): the **source EMF** with the default voltage feed, or the **feed current** with `feed = "current"`. Raw current density J₀ for `current_source`. |
 | `phase` | 0 | Degrees. |
 | `waveform` | `"cw"` | `"cw"` (continuous sine) or `"pulse"` (Gaussian-modulated sine, a wave packet). |
 | `ramp` | 3 | CW turn-on time in periods. The smooth ramp keeps the start-up transient small. |
@@ -238,18 +238,89 @@ All sources share these timing keys:
 |---|---|---|
 | `plane_wave{}` | `axis="x"`, `position`, `polarization`, `direction="+"` | A uniform current sheet across the domain. With `direction = "+"` or `"-"`, two sheets λ/4 apart (the second delayed by T/4) radiate one way only. For CW this is exact; for pulses there's a small backward leak. `"both"` uses a single sheet radiating both ways. `polarization` must be perpendicular to `axis` (default z, or x for sheets normal to z). |
 | `gaussian_beam{}` | as `plane_wave`, plus `center` (transverse position) and `waist` (1/e field radius, default 2λ) | Finite-width beam with its waist at the source plane. |
-| `dipole{}` | `center`, `orientation="z"`, `length=0` | `length = 0` gives a Hertzian point dipole (an "oscillating electron"; any orientation). `length > 0` gives a uniform-current wire antenna (axis-aligned only). |
-| `loop{}` | `center`, `normal="z"`, `size=4` | Small square current loop (magnetic dipole), counter-clockwise about `normal`. |
-| `array{}` | `center`, `elements` (`8` or `{4,4}`), `axis` (`"y"` or `{"y","z"}`), `spacing` (default λ/2, or `{dy, dz}`), `orientation="z"`, `length` (default λ/2), `steer` or `phase_step`, `taper` | Phased array of dipoles. `steer` (degrees from broadside toward +axis) sets phase step Δφ = −k·d·sin θ; `phase_step` sets it directly in degrees. Use `{a, b}` per axis for 2-D arrays. `taper`: `"uniform"`, `"binomial"`, `"hann"`, `"cosine"`, `"triangular"`, or a list of weights (1-D). |
+| `dipole{}` | `center`, `orientation="z"`, `length=0`, plus the antenna keys | With `length > 0`: a **real centre-fed dipole**, a thin wire with a feed gap at its centre (see below). With `length = 0`: an ideal Hertzian point dipole (an "oscillating electron"; any orientation). |
+| `monopole{}` | `base`, `orientation="+z"`, `length=λ/4`, plus the antenna keys | A **real monopole**: a conductor standing on a ground, fed across a one-cell gap at its base. `base` is the lattice point on the conducting surface (plate, radials, waveguide wall); build that ground yourself. A warning appears if nothing conducts at the base. |
+| `loop{}` | `center`, `normal="z"`, `size=4`, plus the antenna keys | A square wire loop (side in cells) fed across a gap in one side. A loop much smaller than λ is a magnetic dipole; one about a wavelength around radiates along its axis. |
+| `wire{}` | `from`, `to`, `radius=λ/400` | A passive thin conductor (reflector, director, radial) between two lattice points along x, y or z. |
+| `array{}` | `center`, `elements` (`8` or `{4,4}`), `axis` (`"y"` or `{"y","z"}`), `spacing` (default λ/2, or `{dy, dz}`), `orientation="z"`, `length` (default 0.45λ), `steer` or `phase_step`, `taper`, plus the antenna keys | Phased array of centre-fed dipoles, each with its own feed (port). `steer` (degrees from broadside toward +axis) sets phase step Δφ = −k·d·sin θ; `phase_step` sets it directly in degrees. Use `{a, b}` per axis for 2-D arrays. `taper`: `"uniform"`, `"binomial"`, `"hann"`, `"cosine"`, `"triangular"`, or a list of weights (1-D). |
 | `current_source{}` | `min`/`max` or `center`/`size`, `polarization`, `softness={sx,sy,sz}` | Generic impressed current density with a soft-edged box footprint. The building block behind all the others. |
 
-Sources are *soft* current sources: reflected waves pass through them. All wires have a Gaussian cross-section about 0.75 cells in radius.
+**Antenna keys** (`dipole` with a length, `monopole`, `loop`, `array`): `model` (`"thin"` default, `"rod"`, `"current"`), `radius` (thin wires, cells, default λ/400), `feed` (`"voltage"` default, `"current"`), `impedance` (Ω, default 50), `material` (rods). See below.
+
+Illumination sources are *soft*: reflected waves pass through them. Ideal (`model = "current"`) wire elements have a Gaussian cross-section about 0.75 cells in radius.
+
+### Real antennas: thin wires, feeds and ports
+
+`dipole`, `monopole`, `loop` and `array` build antennas the way they are built in practice: **metal conductors driven by a feed across a small gap**. The feed is at the centre of a dipole, the base of a monopole, or one side of a loop. The solver works out how current distributes over the metal. On a half-wave dipole that's roughly sinusoidal and zero at the tips, and it sets both the pattern and the feed impedance. Nearby metal (reflectors, directors, ground planes, radials) picks up induced currents the same way.
+
+**Conductor models** (key `model`):
+
+| Model | What it is | Use for |
+|---|---|---|
+| `"thin"` (default) | A wire of real radius `radius` (cells; default λ/400) running along a line of grid edges. It uses the Umashankar–Taflove **sub-cell thin-wire model**: the wire's edges are perfect conductors, and the four magnetic-field updates circling each edge use the factor 2/ln(Δ/a), which represents the 1/r fields of a wire much thinner than a cell. Radius must be ≤ 0.4 cells. | Real antenna wires, which are almost always thinner than a cell |
+| `"rod"` | A solid 1 × 1-cell metal conductor (voxels), electrically a fat wire (~0.3-cell equivalent radius). Accepts `material`. | Thick conductors, or comparison with thin wires |
+| `"current"` | Ideal impressed current, no metal. | Theory checks: textbook array factors, Hertzian dipole |
+
+**Feeds** (key `feed`):
+
+| Feed | What it is | `amplitude` means |
+|---|---|---|
+| `"voltage"` (default) | A **resistive voltage source**: EMF V_s behind an internal resistance R_s (key `impedance`, default 50 Ω), like a transmitter behind a matched line. It's implemented as its Norton equivalent: the gap edge(s) get conductance 1/R_s plus an impressed current −V_s/R_s, so the open-circuit gap voltage is V_s. | peak EMF V_s (normalized; ×E₀Δ → volts) |
+| `"current"` | Ideal current source: the gap current is forced regardless of the load. | peak feed current |
+
+**Every feed is a measurement port.** At the analysis frequency the console reports:
+
+```
+port  dipole  Z =  64.3 -21.1j ohm | Gamma 0.220 @ -45 deg (S11 -13.2 dB), VSWR 1.56 vs 50 ohm | P_acc 8.937e-01 of 9.418e-01 avail (95%)
+radiation resistance R_rad = 2 P_rad / |I|^2 = 64.0 ohm, radiation efficiency P_rad / P_acc = 100%
+```
+
+| Quantity | Meaning |
+|---|---|
+| Z = R + jX | Input impedance at the feed, from the complex amplitudes of the gap voltage and the current through the gap (the loop integral of H around it). R is the part that absorbs power (radiation + losses); X is the reactance (energy stored near the antenna). |
+| Γ, S11 | Reflection coefficient against the feed impedance R_s: Γ = (Z − R_s)/(Z + R_s); S11 = 20 log₁₀\|Γ\| dB. |
+| VSWR | (1 + \|Γ\|)/(1 − \|Γ\|): 1 is a perfect match; 2 means about 11% of the power is reflected. |
+| P_acc / avail | Power the antenna accepts, ½Re(V·I*), versus the source's available power V_s²/(8R_s). Their ratio is 1 − \|Γ\|². |
+| R_rad, efficiency | Radiation resistance 2P_rad/\|I\|² from the far-field monitor's radiated power (single-port scenes), and P_rad/P_acc. With perfect conductors, R_rad = Re Z and the efficiency is ~100%. This is an independent check on the port. |
+
+In arrays every element is its own port, and the reported impedances are **active impedances**: they include mutual coupling and change as the beam is steered.
+
+```lua
+dipole   { center = grid.center, orientation = "z", length = 19, radius = 0.1 }        -- 50-ohm voltage feed
+box      { min = vec(24, 24, 63), max = vec(105, 105, 64), material = "metal" }        -- ground plate, top face z = 64
+monopole { base = vec(64, 64, 64), orientation = "+z", length = 5 }                    -- quarter-wave on the plate
+wire     { from = vec(70, 64, 60), to = vec(70, 64, 70), radius = 0.1 }                -- passive element (parasitic)
+```
+
+`wire{}` builds a passive thin conductor between two lattice points that differ along one axis. Use it for reflectors, directors and radials. A wire end that touches another wire or a metal cell is electrically joined to it.
+
+**Measured accuracy** (thin wires, induced-EMF theory for comparison):
+
+| Antenna | Measured | Theory |
+|---|---|---|
+| Dipole 0.175λ, 40 cells/λ | 5.9 − j812 Ω | 6.3 − j807 Ω |
+| Dipole 0.375λ | 32.6 − j222 Ω | 34.0 − j222 Ω |
+| Dipole 0.475λ | 62.9 − j37 Ω, 2.11 dBi | 63.0 − j11 Ω, 2.12 dBi |
+| Monopole on a 4λ plate (20 cells/λ) | 34.8 − j6 Ω, 5.7 dBi, beam 28° up | ~36 Ω on an *infinite* plane (5.15 dBi at the horizon) |
+| Yagi, 4 directors | 10.9 dBi, F/B 24 dB, Z = 35 − j70 Ω | typical: ~11 dBi, low feed impedance |
+
+Radiation resistance agrees within a few percent. Reactance agrees closely for short antennas and is somewhat lower near resonance, which puts resonance about 1% of λ (at 40 cells/λ) to 3% (at 20 cells/λ) longer than the induced-EMF formula.
+
+Things to know:
+- **End correction.** The lattice node at the free end of a thin wire holds more charge than a real wire's tip, which made wires act about one cell longer per free end. Each free end is therefore built one cell short, automatically, so the *electrical* length matches the length you ask for. Ends that touch another conductor (another wire, a metal plate, a radial hub, the corners of a loop) aren't free and aren't shortened. The overlay draws wires at their requested length.
+- **Lengths in whole cells.** A dipole is two arms plus the one-cell gap, so its length is odd (`length = 8` becomes 7 or 9, with a warning). A monopole is the gap plus the conductor. Wires follow grid lines; feed positions snap to the nearest lattice line.
+- **Thin wires are invisible in the volume render** (they're thinner than a cell). The overlay draws them as bright lines.
+- **Straight wires only.** Thin wires run along x, y or z. Slanted conductors (such as drooping radials) can be staircased from metal cells with `shape{}`, which is approximate.
+- **Far field with grounds.** A ground plate must fit *inside* the far-field box, so a truly infinite plane (one reaching into the absorbing layer) can't be combined with `far_field{}`. Finite plates show the real-world behavior anyway.
+- **Not modelled:** feed lines, baluns and matching networks (the port shows the bare antenna impedance), wire losses (wires are perfect conductors), and frequency sweeps (impedance is computed at one frequency per run; change `wavelength`/`frequency` or the length to sweep).
+
+`12_monopole_ground.lua` compares ground planes and counterpoises; `validation/dipole_impedance.lua` reproduces the table above.
 
 ---
 
 ## 8. Instruments
 
-Results appear in the console every 2 s, and immediately when you press **P**. The first probe and flux monitor are also shown in the title bar, along with D_max. **Tab** cycles through probes; the arrow keys and PgUp/PgDn move the selected probe. Add `log = "file.csv"` to any instrument to record data. Relative paths go in the scene's output folder.
+Results appear in the console every 2 s, and immediately when you press **P**. A scene without instruments keeps the console quiet; it prints a one-line hint when it loads. The first probe, the first flux monitor, the first antenna port (Z, VSWR) and D_max are also shown in the title bar. Antenna feeds are ports automatically (see §7); **P** lists every port. **Tab** cycles through probes; the arrow keys and PgUp/PgDn move the selected probe. Add `log = "file.csv"` to any instrument to record data. Relative paths go in the scene's output folder.
 
 | Primitive | Keys | Measures | CSV columns |
 |---|---|---|---|
@@ -267,7 +338,7 @@ D_max is searched over the three cuts plus a 10° grid covering the whole sphere
 
 **Far-field rules.** The far-field box must enclose all sources and objects, lie in vacuum, and stay out of the absorbing layer. The app warns otherwise. Plane-wave sources cross the box, so the pattern is only meaningful for localized antennas. The pattern is computed at one frequency (CW). After a change, allow about 3 × `averaging` periods for it to settle; the report says "still settling" until then.
 
-**Validated accuracy.** For a Hertzian dipole (theory 1.76 dBi, HPBW 90°), the far-field monitor gives 1.87 dBi and 87.5° at 16 cells/λ, and 1.78 dBi and 89.4° at 32 cells/λ. The error is second order: it falls about 4× each time the resolution doubles. The closed flux box matches the analytic radiated power to within 0.3%.
+**Validated accuracy.** For a Hertzian dipole (`scenes/validation/hertzian_dipole.lua`; theory 1.76 dBi, HPBW 90°), the far-field monitor gives 1.87 dBi and 87.5° at 16 cells/λ, and 1.78 dBi and 89.4° at 32 cells/λ. The error is second order: it falls about 4× each time the resolution doubles. The closed flux box matches the analytic radiated power to within 0.3%.
 
 ---
 
@@ -277,7 +348,8 @@ D_max is searched over the three cuts plus a 10° grid covering the whole sphere
 - **Clearance.** Keep sources, objects and instruments at least λ/2 away from the absorbing layer. For far fields, also leave a few cells between the objects and the far-field box.
 - **Steady state.** CW results (patterns, time-averaged flux) need the start-up transient to pass. That takes the ramp time plus the time for waves to cross the domain, typically 10–20 periods. Press **R** to restart a measurement.
 - **Staircasing.** Curved and tilted surfaces are approximated with cubes, and features thinner than one cell vanish. Each E component uses the average material of the four cells around its Yee edge. That makes metal objects conduct on every face and averages permittivity at interfaces.
-- **Thin wires.** A 1 × 1-cell metal rod behaves like a *fat* wire, with an equivalent radius of about 0.3 cells. At 20 cells/λ its first resonance is about 0.42λ, shorter than a thin wire's ~0.48λ, so tune parasitic elements accordingly (see `06_yagi_uda.lua`). Give lengths in whole cells with `min`/`max`: a cell is filled when its centre lies inside the shape, so fractional lengths round unpredictably.
+- **Wires.** Use thin wires (the default) for antennas. A 1 × 1-cell metal rod (`model = "rod"` or a `box`) behaves like a *fat* wire, with an equivalent radius of about 0.3 cells, resonating near 0.42λ instead of ~0.48λ. Give geometry lengths in whole cells: a cell is filled when its centre lies inside the shape, so fractional lengths round unpredictably.
+- **Impedance.** For accurate impedances use 30–40 cells per wavelength (resonant length within ~1% of λ at 40 cells/λ, ~3% at 20). Let the port average settle (the report says when); after changing a parameter, wait about 12 periods or press **R**.
 - **Metals.** `metal`, `copper`, `pec` and friends all behave as near-perfect conductors at practical cell sizes, because their skin depth is far below one cell. To study finite conductivity, use a lossy `material{ sigma = ... }` in the range 0.1–10.
 
 ---
@@ -286,7 +358,8 @@ D_max is searched over the three cuts plus a 10° grid covering the whole sphere
 
 - Non-magnetic materials only (μ_r = 1), and no frequency dispersion.
 - Materials are isotropic and constant within each cell.
-- Sources are impressed currents. There is no feed-gap voltage, so input impedance isn't available.
+- Thin wires must run along x, y or z, at least a couple of cells from other conductors (except where they join). Wires are perfect conductors (no ohmic loss).
+- Antenna feeds are lumped sources in a one-cell gap. Feed lines, baluns and matching networks aren't modelled, and impedance is evaluated at one frequency per run.
 - One far-field monitor per scene, at a single frequency.
 - There is no total-field/scattered-field formulation, so radar cross-section isn't computed. Measure scattering with probes and flux monitors instead.
 - Physical units are optional. Without them, all results are in normalised units (ε₀ = μ₀ = c = 1, one cell = 1).

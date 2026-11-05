@@ -56,7 +56,7 @@ struct Options {
 void printUsage() {
     std::printf(
         "EM_Lab [options]\n"
-        "  --script FILE.lua      load a scene script\n"
+        "  --script FILE[.lua]    load a scene script (relative: current folder, then scenes folder)\n"
         "  --scene N              load the N-th script of the scenes directory (default 1)\n"
         "  --set NAME=VALUE       override a script param{} (repeatable)\n"
         "  --list                 list the bundled scenes and exit\n"
@@ -119,6 +119,32 @@ std::vector<fs::path> listScripts(const fs::path& dir) {
         if (e.is_regular_file() && e.path().extension() == ".lua") out.push_back(e.path());
     std::sort(out.begin(), out.end());
     return out;
+}
+
+// Resolves a --script argument. Absolute paths are used as given; relative paths are
+// tried against the current directory first and then the scenes directory. A missing
+// ".lua" extension is added. Returns an empty path if nothing exists and lists every
+// absolute path that was checked in `tried`.
+fs::path resolveScript(const fs::path& requested, const fs::path& sceneDir, std::vector<fs::path>& tried) {
+    std::vector<fs::path> names{requested};
+    if (requested.extension() != ".lua") names.push_back(fs::path(requested).concat(".lua"));
+
+    std::error_code ec;
+    std::vector<fs::path> bases;
+    if (requested.is_absolute()) {
+        bases.emplace_back();
+    } else {
+        bases.push_back(fs::current_path(ec));
+        if (!sceneDir.empty()) bases.push_back(fs::absolute(sceneDir, ec));
+    }
+    for (const fs::path& base : bases)
+        for (const fs::path& name : names) {
+            const fs::path candidate = (base.empty() ? name : base / name).lexically_normal();
+            if (std::find(tried.begin(), tried.end(), candidate) != tried.end()) continue;
+            tried.push_back(candidate);
+            if (fs::is_regular_file(candidate, ec)) return candidate;
+        }
+    return {};
 }
 
 bool sameGrid(const GridConfig& a, const GridConfig& b) {
@@ -234,6 +260,7 @@ private:
     std::vector<ScriptParam> m_params;
     GridConfig m_gridConfig;
     MaterialVolume m_materials;
+    SubcellModel m_subcell;
 
     // Run state
     bool m_running = true;
@@ -268,7 +295,20 @@ Application::Application(const Options& opt) : m_opt(opt), m_stepsPerFrame(opt.s
 
     bool loaded = false;
     if (!opt.script.empty()) {
-        loaded = loadScript(opt.script, opt.sets, true);
+        std::vector<fs::path> tried;
+        const fs::path script = resolveScript(opt.script, sceneDir, tried);
+        if (script.empty()) {
+            std::fprintf(stderr, "\nSCRIPT ERROR: cannot find script '%s'. Looked for:\n", opt.script.c_str());
+            for (const fs::path& t : tried) std::fprintf(stderr, "    %s\n", t.string().c_str());
+            std::fprintf(stderr, "  (relative paths are tried in the current folder, then in the scenes folder)\n");
+            m_scriptError = true;
+        } else {
+            std::printf("Script:  %s\n", script.string().c_str());
+            // A script from the scenes folder keeps its place in the F6 / F7 sequence.
+            for (size_t i = 0; i < m_sceneList.size(); ++i)
+                if (fs::equivalent(m_sceneList[i], script, ec)) m_sceneIndex = static_cast<int>(i);
+            loaded = loadScript(script, opt.sets, true);
+        }
     } else if (!m_sceneList.empty()) {
         m_sceneIndex = std::clamp(opt.scene, 1, static_cast<int>(m_sceneList.size())) - 1;
         loaded = loadScript(m_sceneList[static_cast<size_t>(m_sceneIndex)], opt.sets, true);
@@ -376,13 +416,15 @@ void Application::applyScene(ScriptResult&& result, bool newScene) {
 
     // Keep the running fields when only sources / instruments / view changed
     // (live parameter tweaks such as beam steering); rebuild otherwise.
+    // The sub-cell model includes thin wires and feed resistors, so it counts as geometry.
     const bool keepFields = m_hasScene && !newScene && sameGrid(env.grid, m_gridConfig) &&
-                            sameMaterials(env.materials, m_materials);
+                            sameMaterials(env.materials, m_materials) && env.subcell == m_subcell;
     if (!keepFields) {
         grid.configure(env.grid);
-        grid.uploadMaterials(env.materials);
+        grid.uploadMaterials(env.materials, env.subcell);
         m_gridConfig = grid.config();
         m_materials = std::move(env.materials);
+        m_subcell = env.subcell;
     }
     grid.setSources(env.sources);
     m_gpu->instruments.configure(grid, env, result.outputDir, result.warnings);
@@ -403,6 +445,7 @@ void Application::applyScene(ScriptResult&& result, bool newScene) {
                     env.referenceWavelength, 299792458.0 / (env.referenceWavelength * env.cellSize) * 1e-9,
                     env.cellSize * 1e3, grid.sources().size());
         printParams();
+        if (m_gpu->instruments.empty()) std::printf("%s\n", Instruments::kNoInstrumentsHint);
     } else if (!keepFields) {
         std::printf("Reloaded '%s' (geometry changed: fields reset)\n", env.name.c_str());
     } else {
@@ -553,6 +596,7 @@ void Application::handleKey(const SDL_KeyboardEvent& k) {
             inst.measure(m_gpu->grid);
             inst.evaluateFarField(m_gpu->grid);
             inst.printReport(m_gpu->grid);
+            if (inst.hasPorts()) inst.printAllPorts(m_gpu->grid);
             return;
         case SDLK_F12: m_screenshotRequested = true; return;
         case SDLK_F1: printHelp(); return;
@@ -697,7 +741,7 @@ int Application::run() {
         m_singleStep = false;
         if (steps > 0) {
             m_gpu->simTimer.begin();
-            if (inst.hasFarField()) grid.step(steps, [&] { inst.onStep(grid); });
+            if (inst.needsEveryStep()) grid.step(steps, [&] { inst.onStep(grid); });
             else grid.step(steps);
             m_gpu->simTimer.end();
         }
@@ -705,7 +749,7 @@ int Application::run() {
         // ---- measure (readbacks are small but synchronous: throttle) ----------
         if (m_frame % 2 == 0 || steps == 0) inst.measure(grid);
         farFieldTimer += dt;
-        if (inst.hasFarField() && (farFieldTimer > 1.0 || (m_opt.frames > 0 && m_frame % 50 == 49))) {
+        if (inst.needsEveryStep() && (farFieldTimer > 1.0 || (m_opt.frames > 0 && m_frame % 50 == 49))) {
             farFieldTimer = 0.0;
             inst.evaluateFarField(grid);
         }
@@ -743,14 +787,15 @@ int Application::run() {
             framesSinceTitle = 0;
         }
         const bool selfTest = m_opt.frames > 0;
+        // Periodic reports only when there is something to report (P always prints).
         if ((!selfTest && reportTimer >= 2.0) || (selfTest && m_frame % 100 == 0)) {
-            inst.printReport(grid);
+            if (!inst.empty()) inst.printReport(grid);
             reportTimer = 0.0;
         }
         if (selfTest && m_frame >= static_cast<std::uint64_t>(m_opt.frames)) {
             inst.measure(grid);
             inst.evaluateFarField(grid);
-            inst.printReport(grid);
+            if (!inst.empty()) inst.printReport(grid);
             std::printf("GPU timings: sim %.3f ms/frame (%d steps), render %.3f ms\n", m_gpu->simTimer.milliseconds(),
                         m_stepsPerFrame, m_gpu->renderTimer.milliseconds());
             m_running = false;
@@ -767,12 +812,14 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     // Must run before SDL loads the OpenGL driver (Linux PRIME offload variables).
     gpu::requestHighPerformanceGpu();
+    const Options options = parseOptions(argc, argv);
     try {
-        Application app(parseOptions(argc, argv));
+        Application app(options);
         return app.run();
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "Fatal: %s\n", ex.what());
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "EM_Lab", ex.what(), nullptr);
+        // A dialog would block unattended (--frames) runs until someone clicks it.
+        if (options.frames == 0) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "EM_Lab", ex.what(), nullptr);
         return 1;
     }
 }

@@ -1,5 +1,5 @@
 -- Phased antenna array
--- A line of half-wave dipoles spaced lambda/2 along y. A progressive phase shift
+-- A line of centre-fed metal half-wave dipoles spaced lambda/2 along y. A progressive phase shift
 -- dphi = -k d sin(theta) between neighbours steers the main beam to angle theta
 -- (measured from broadside, +x, toward +y). Amplitude tapers trade beamwidth for
 -- lower side lobes.
@@ -10,8 +10,8 @@
 scene {
   name        = "Phased Antenna Array",
   description = "Steerable line array of z-dipoles. The far-field monitor reports directivity and beamwidth.",
-  size        = {160, 160, 96},
-  wavelength  = 16,
+  size        = {176, 176, 96},
+  wavelength  = 18,            -- lambda/2 = 9 cells: element length and spacing land on whole cells
 }
 
 local steer = param { name = "steer", label = "steer (deg)", default = 0, min = -60, max = 60, step = 10, keys = {",", "."} }
@@ -24,8 +24,8 @@ array {
   axis        = "y",
   spacing     = wavelengths(0.5),
   orientation = "z",
-  length      = wavelengths(0.5),
-  amplitude   = 1.8,
+  length      = 9,              -- thin-wire half-wave dipoles (9 cells = 0.5 lambda), each fed at its centre gap
+  amplitude   = 1,              -- source EMF per element (each element has its own 50-ohm feed)
   steer       = steer,
   taper       = taper,
 }

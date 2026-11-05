@@ -23,7 +23,7 @@ if ground ~= "none" then
   box { min = vec(0, 0, 0), max = vec(grid.nx, grid.ny, zg), material = ground }
 end
 
-dipole { center = c, orientation = "y", length = grid.wavelength / 2, amplitude = 3 }
+dipole { center = c, orientation = "y", length = 9, amplitude = 1 }   -- thin-wire half-wave dipole, 50-ohm feed
 
 for z = zg + 4, grid.nz - grid.pml - 4, 8 do
   probe { position = vec(c.x + 40, c.y, z), name = string.format("z=%d", z) }

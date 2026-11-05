@@ -22,7 +22,7 @@ Shaders and scenes are copied next to the executable after each build. When the 
 
 | Option | Purpose |
 |---|---|
-| `--script FILE.lua` | load a scene script |
+| `--script FILE.lua` | load a scene script. A relative path is tried in the current folder, then in `scenes/`; `.lua` is optional, so `--script test` finds `scenes/test.lua`. |
 | `--scene N` | load the N-th bundled scene |
 | `--list` | list the bundled scenes |
 | `--set NAME=VALUE` | override a script parameter (repeatable) |
@@ -54,27 +54,31 @@ far_field {}
 |---|---|
 | Geometry | `box`, `sphere` / ellipsoid, `cylinder` / tube, `wall` with slits and apertures, `grating`, `cage`, `frame`, and procedural `shape{ inside = function(x, y, z) ... end }`. Shapes can be rotated and hollowed. |
 | Materials | 30 built-in (metals, PEC, dielectrics, building materials, water, ground) plus custom ones defined by ε_r with σ, conductivity in S/m, or loss tangent |
-| Sources | `plane_wave` (one-way or two-way), `gaussian_beam`, `dipole` (point or wire), `loop`, phased `array` (1-D or 2-D, with steering and tapers), and generic `current_source`. Waveforms: CW or pulses. |
+| Antennas | Real antennas: thin wires (sub-cell thin-wire model with real radius) fed by a 50 Ω resistive voltage source: `dipole`, `monopole`, `loop`, phased `array` (1-D or 2-D, steering, tapers); passive `wire` elements. Every feed is a port reporting input impedance, Γ / S11, VSWR, accepted power and radiation resistance. |
+| Sources | Illumination: `plane_wave` (one-way or two-way), `gaussian_beam`. Ideal elements for theory checks: point (Hertzian) dipole, `model = "current"`, generic `current_source`. Waveforms: CW or pulses. |
 | Instruments | `probe`, `flux_plane`, `flux_box`, and `far_field` (radiation pattern, directivity in dBi, beamwidth, front/back), each with optional CSV logging |
 | Interactivity | `param{}` binds keys to values. The script is re-run when a key is pressed, keeping the fields when only sources changed. Saving the file hot-reloads it. |
 
 The full reference, covering units, every key, the material table, accuracy guidelines and limitations, is in **[docs/SCRIPTING.md](docs/SCRIPTING.md)**.
 
-**Bundled scenes** (in [scenes/](scenes/); keys 1–9 and 0, F6/F7 to step through):
+**Validation scenes** in [scenes/validation/](scenes/validation/) use idealized sources that can't be built but have exact textbook answers, to check the solver: `EM_Lab --script validation/hertzian_dipole`.
+
+**Bundled scenes** (in [scenes/](scenes/); keys 1–9 and 0, F6/F7 to step through). Every antenna is built from metal and fed the way a real one is:
 
 | # | Scene | Parameters | What it shows |
 |---|---|---|---|
 | 1 | Double slit | slit width `, .`; separation `; '` | Interference fringes; spacing ∝ λ/d |
 | 2 | Faraday cage | cage `G`; mesh pitch `, .` | −56 dB interior field; shielding collapses as the openings approach λ/2 |
-| 3 | Phased array | steer `, .`; elements `; '`; taper `T` | Beam steering, beamwidth ∝ 1/N, sidelobe tapers |
-| 4 | Oscillating dipole | CW / pulse `T` | Doughnut pattern: 1.87 dBi measured at 16 cells/λ (theory 1.76 dBi); radiated power |
+| 3 | Phased array | steer `, .`; elements `; '`; taper `T` | Half-wave elements with 50 Ω feeds: beam steering, beamwidth ∝ 1/N, sidelobe tapers, active (scan) impedance |
+| 4 | Half-wave dipole | length `, .`; wire thickness `T` | Thin-wire dipole, 50 Ω feed: 64 − j21 Ω, VSWR 1.56 at 0.475λ; find resonance; pattern vs length |
 | 5 | Ball lens | ε_r `, .` | Focusing; the probe tracks the paraxial focus |
-| 6 | Yagi-Uda | directors `, .` | 11 dBi, 19 dB front/back from parasitic elements |
-| 7 | Pyramidal horn | flare length `, .` | Procedural geometry; 16.5 dBi |
+| 6 | Yagi-Uda | directors `, .`; driven length `; '` | 10.9 dBi, 24 dB front/back; low feed impedance (why Yagis need matching) |
+| 7 | Pyramidal horn | flare length `, .` | Procedural geometry, thin-wire coax-probe feed; 16.5 dBi |
 | 8 | Wire-grid polarizer | polarization `X`; grid `G` | E ∥ wires −24 dB, E ⊥ wires passes |
 | 9 | Dipole over ground | height `, .`; ground material `G` | Two-ray interference lobes |
 | 10 | Prism | ε_r `, .` | Total internal reflection above ε_r = 2 |
-| 11 | Planar array + reflector | azimuth `, .`; elevation `; '`; ground `G` | 2-D steering, 18.6 dBi, 43 dB front/back |
+| 11 | Planar array + reflector | azimuth `, .`; elevation `; '`; ground `G` | 2-D steering, 18.7 dBi, 42 dB front/back |
+| 12 | Monopole: ground plane vs counterpoise | ground `G` | Plates, horizontal / drooping radials, dipole reference: feed impedance (35 Ω on a 4λ plate), beam tilt |
 
 ## Controls
 
@@ -120,7 +124,8 @@ src/
   Main.cpp            SDL3 lifecycle, input, scene loading / hot reload / params, simulate -> measure -> render loop
   ScriptEngine.*      Sandboxed Lua runtime and scene API (validation, typo hints, units, material library)
   Environment.*       Scene description, composable shapes (transform / difference / lambda / wall), voxeliser
-  SimulationGrid.*    Yee textures, edge-averaged material texture, source SSBOs, leapfrog dispatches
+  SimulationGrid.*    Yee textures, edge-averaged materials + sub-cell overrides, thin-wire B coefficients, sources, leapfrog
+  Ports.*             Antenna feed ports: gap voltage / current DFT -> impedance, Gamma, VSWR, power
   Instruments.*       Probes, flux monitors, far-field monitor: averaging, CSV logs, reports, overlay
   FarField.*          GPU near-to-far-field transform: running DFT on a Huygens box, pattern and directivity
   FieldAnalyzer.*     Staggering-aware probe readback, GPU Poynting flux through planes / boxes
@@ -133,31 +138,38 @@ shaders/
   field_sampling.glsl E / B co-located at lattice nodes (shared by flux and NTFF)
   poynting_flux.comp  Shared-memory reduction of (E×B)·n over a rectangle
   ntff_*.comp/.glsl   Far-field: phasor accumulation and radiation integrals
+  port_accumulate.comp Antenna ports: running DFT of gap voltage and current
   clear_fields.comp, fullscreen.vert, raymarch.frag, lines.*
-scenes/               Bundled Lua scenes
+scenes/               Bundled Lua scenes (scenes/validation/: idealized analytic checks)
 docs/SCRIPTING.md     Scripting reference
+docs/UNITS.md         Normalized units and conversion to SI
 external/glad         GLAD 0.1.36 loader, OpenGL 4.6 Core (generated)
 ```
 
 ### Physics notes
 
-- **Units.** c = ε₀ = μ₀ = 1 and one cell is one length unit, so dt equals the Courant number S (0.5, below the 3D limit of 1/√3). The B texture stores c·B, so the Poynting vector is simply S = E × B. A script's `cell_size` maps all of this onto SI units.
+- **Units.** c = ε₀ = μ₀ = 1 and one cell is one length unit, so dt equals the Courant number S (0.5, below the 3D limit of 1/√3). The B texture stores c·B, so the Poynting vector is simply S = E × B. A script's `cell_size` sets the physical length scale; [docs/UNITS.md](docs/UNITS.md) explains how to convert every input and output to SI units.
 - **Memory layout.** `E_Field_Tex` RGBA32F holds (Ex, Ey, Ez, σ) and `B_Field_Tex` RGBA32F holds (Bx, By, Bz, ε_r), with σ and ε_r per cell; the staggered positions are documented in `common.glsl`. A third texture holds the edge-averaged materials, so GPU memory is 48 bytes per cell. Each pass updates its own field in place.
 - **Edge-averaged materials.** Each E component sits on a Yee edge shared by four cells. The solver uses those cells' average σ and ε_r, precomputed into a packed half-float texture. This zeros tangential E on every face of a metal object, so staircased PEC is symmetric and thin rods behave like proper wires. It also gives the standard averaged permittivity at dielectric interfaces.
 - **Lossy media.** An exponential time integrator, E ← e^(−x)·E + (dt/ε)·φ(x)·(∇×B − J) with x = σ·dt/ε, is unconditionally stable for any conductivity. Unlike Crank–Nicolson, it has no sign-flip ringing in metals. Edge conductivities are stored as half floats and clamped at 6×10⁴ (normalized), which is already a perfect conductor (field decay factor e^(−30000) per step).
 - **Absorbing boundary.** Exponentially graded conductivity with a matched magnetic loss, so the layer's impedance equals free space. Normal-incidence reflection is about 10⁻⁶.
 - **Sources.** J = p·A·w(x)·s(t). The footprint w(x) is a soft box with per-axis Gaussian edges, covering points, wires, sheets and beams. The signal s(t) is evaluated in double precision on the CPU for each sub-step. One-way plane waves use two sheets λ/4 apart, the second delayed by T/4.
+- **Thin wires.** Umashankar–Taflove sub-cell model: the wire's grid edges are perfect conductors, and the four B updates circling each edge use 2/ln(Δ/a) for the 1/r near field of a wire of radius a. Free wire ends are built one cell short to cancel the grid's end-capacitance effect, so the electrical length matches the requested length.
+- **Feeds and ports.** A resistive voltage source (EMF behind 50 Ω) as its Norton equivalent: gap conductance plus impressed current. Ports record the gap voltage and the current through the gap at the analysis frequency, giving Z, Γ, VSWR and accepted power. The far-field radiated power provides an independent check (R_rad = Re Z).
 - **Far field.** A running single-frequency DFT of E and H on a closed Huygens box (two cascaded averages, about 0.2% ripple), trapezoid-weighted surface integration, and radiation integrals evaluated on the GPU in one workgroup per direction. D = 4πU / P_rad, with P_rad taken from the same surface.
 
 ### Validation (measured with this code)
 
 | Test | Result | Reference |
 |---|---|---|
-| Hertzian dipole directivity | 1.87 dBi at 16 cells/λ, 1.78 dBi at 32 cells/λ | 1.76 dBi (second-order convergence) |
+| Hertzian dipole directivity (`validation/hertzian_dipole`) | 1.87 dBi at 16 cells/λ, 1.78 dBi at 32 cells/λ | 1.76 dBi (second-order convergence) |
 | Hertzian dipole HPBW | 87.5° / 89.4° | 90° |
+| Thin-wire dipole impedance, 0.175λ / 0.375λ / 0.475λ (`validation/dipole_impedance`) | 5.9 − j812 / 32.6 − j222 / 62.9 − j37 Ω | 6.3 − j807 / 34.0 − j222 / 63.0 − j11 Ω (induced EMF) |
+| Port vs far field (every antenna scene) | R_rad from radiated power = Re Z within 3% | equal for lossless antennas |
+| Monopole on a 4λ plate | 34.8 − j6 Ω, 5.7 dBi, beam 28° up | ~36 Ω, 5.15 dBi at the horizon on an infinite plane |
 | Dipole radiated power (closed flux box) | 0.359 | 0.360 analytic for the discretised current |
-| 8-element λ/2 array beamwidth | 12.6° | 12.7° |
-| 4×4 planar array over a reflector | 18.6 dBi | 18.5 dBi (4πA/λ²) |
+| 8-element λ/2 array beamwidth (thin-wire elements) | 12.7° | 12.7° |
+| 4×4 planar array over a reflector | 18.7 dBi | 18.6 dBi (4πA/λ², A = 2λ × 2.9λ) |
 | Faraday cage (pitch λ/9) | interior \|E\| −56 dB, power −76 dB | — |
 | Wire grid, period λ/6 | E ∥ −24 dB, E ⊥ −0.1 dB | — |
 | Right-angle prism | 87% TIR at n = 1.5; 81% transmitted at n = 1.22 | TIR threshold n = √2 |
