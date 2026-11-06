@@ -13,7 +13,10 @@
 #include "Instruments.hpp"
 #include "ScriptEngine.hpp"
 #include "SimulationGrid.hpp"
+#include "Ui.hpp"
 #include "VolumeRenderer.hpp"
+
+#include <imgui.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -156,11 +159,31 @@ bool sameMaterials(const MaterialVolume& a, const MaterialVolume& b) {
     return a.size() == b.size() && a.sigma() == b.sigma() && a.epsilonR() == b.epsilonR();
 }
 
-const char* keyName(char k) {
-    static char buf[4];
-    buf[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(k)));
-    buf[1] = '\0';
-    return buf;
+// Everything a radar calibration recording depends on besides the geometry: the grid, the
+// transmitter and the recording window. Processing settings (noise, threshold, field of view)
+// are left out, so changing them only re-processes the stored echoes.
+std::vector<double> radarSignature(const Environment& env) {
+    std::vector<double> s;
+    const GridConfig& g = env.grid;
+    s.insert(s.end(), {static_cast<double>(g.size.x), static_cast<double>(g.size.y), static_cast<double>(g.size.z),
+                       static_cast<double>(g.courant), static_cast<double>(g.pmlThickness)});
+    for (const SourceDesc& d : env.sources) {
+        s.insert(s.end(), {d.center.x, d.center.y, d.center.z, d.halfExtent.x, d.halfExtent.y, d.halfExtent.z,
+                           d.polarization.x, d.polarization.y, d.polarization.z, d.softness.x, d.softness.y, d.softness.z,
+                           d.amplitude, d.wavelength, d.phase, static_cast<float>(d.waveform), d.rampPeriods,
+                           d.delayPeriods, d.repeatPeriods, d.enabled ? 1.0f : 0.0f});
+    }
+    if (env.radar) {
+        const RadarSetup& r = *env.radar;
+        s.insert(s.end(), {r.rangeMin, r.rangeMax, r.referenceDistance});
+        if (r.txCenter) s.insert(s.end(), {r.txCenter->x, r.txCenter->y, r.txCenter->z});
+    }
+    return s;
+}
+
+// Returned by value: two calls in one expression must not share a buffer.
+std::string keyName(char k) {
+    return std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(k))));
 }
 
 // -----------------------------------------------------------------------------
@@ -235,6 +258,9 @@ private:
     void updateTitle(double fps);
     void printHelp() const;
     void printParams() const;
+    void drawUi();
+    void drawScenePanel();
+    void drawHelpWindow();
     void setFlyMode(bool fly);
     void saveScreenshot(const std::string& path) const;
 
@@ -242,6 +268,12 @@ private:
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_context = nullptr;
     std::unique_ptr<GpuResources> m_gpu;
+    std::unique_ptr<Ui> m_ui;
+    bool m_showHelp = false;
+    float m_refreshSeconds = 0.5f;  // on-screen readout refresh interval
+    double m_fps = 0.0;
+    std::vector<std::string> m_warnings;
+    std::string m_scriptErrorText;
 
     Camera m_camera;
     RenderSettings m_render;
@@ -257,10 +289,18 @@ private:
     bool m_hasScene = false;
     bool m_scriptError = false;
     std::string m_sceneName = "(no scene)";
+    std::string m_description;
+    float m_cellSize = 1e-3f;
+    float m_referenceWavelength = 16.0f;
     std::vector<ScriptParam> m_params;
     GridConfig m_gridConfig;
     MaterialVolume m_materials;
     SubcellModel m_subcell;
+    // Radar: the calibration scene (targets removed) and what its recording depended on.
+    MaterialVolume m_radarBackground;
+    SubcellModel m_radarBackgroundSubcell;
+    std::vector<double> m_radarSignature;
+    bool m_radarCalibrated = false;
 
     // Run state
     bool m_running = true;
@@ -292,6 +332,7 @@ Application::Application(const Options& opt) : m_opt(opt), m_stepsPerFrame(opt.s
     std::printf("Shaders: %s\nScenes:  %zu script(s) in %s\n", shaderDir.string().c_str(), m_sceneList.size(),
                 m_sceneList.empty() ? "(none found)" : m_sceneList.front().parent_path().string().c_str());
     m_gpu = std::make_unique<GpuResources>(shaderDir);
+    m_ui = std::make_unique<Ui>(m_window, m_context, opt.frames == 0);
 
     bool loaded = false;
     if (!opt.script.empty()) {
@@ -302,6 +343,7 @@ Application::Application(const Options& opt) : m_opt(opt), m_stepsPerFrame(opt.s
             for (const fs::path& t : tried) std::fprintf(stderr, "    %s\n", t.string().c_str());
             std::fprintf(stderr, "  (relative paths are tried in the current folder, then in the scenes folder)\n");
             m_scriptError = true;
+            m_scriptErrorText = "cannot find script '" + opt.script + "'";
         } else {
             std::printf("Script:  %s\n", script.string().c_str());
             // A script from the scenes folder keeps its place in the F6 / F7 sequence.
@@ -334,6 +376,7 @@ Application::Application(const Options& opt) : m_opt(opt), m_stepsPerFrame(opt.s
 
 Application::~Application() {
     m_gpu.reset(); // GL objects must die while the context is still current
+    m_ui.reset();
     if (m_context) SDL_GL_DestroyContext(m_context);
     if (m_window) SDL_DestroyWindow(m_window);
     SDL_Quit();
@@ -386,6 +429,7 @@ bool Application::loadScript(const fs::path& path, const std::map<std::string, s
     } catch (const ScriptError& e) {
         std::fprintf(stderr, "\nSCRIPT ERROR in %s:\n  %s\n", path.filename().string().c_str(), e.what());
         m_scriptError = true;
+        m_scriptErrorText = path.filename().string() + ": " + e.what();
         // Track the file anyway so saving a fix hot-reloads it.
         m_scriptPath = path;
         std::error_code ec;
@@ -394,9 +438,11 @@ bool Application::loadScript(const fs::path& path, const std::map<std::string, s
     } catch (const std::exception& e) {
         std::fprintf(stderr, "\nERROR while building %s: %s\n", path.filename().string().c_str(), e.what());
         m_scriptError = true;
+        m_scriptErrorText = path.filename().string() + ": " + e.what();
         return false;
     }
     m_scriptError = false;
+    m_scriptErrorText.clear();
     m_scriptPath = path;
     std::error_code ec;
     m_scriptTime = fs::last_write_time(path, ec);
@@ -417,20 +463,52 @@ void Application::applyScene(ScriptResult&& result, bool newScene) {
     // Keep the running fields when only sources / instruments / view changed
     // (live parameter tweaks such as beam steering); rebuild otherwise.
     // The sub-cell model includes thin wires and feed resistors, so it counts as geometry.
-    const bool keepFields = m_hasScene && !newScene && sameGrid(env.grid, m_gridConfig) &&
-                            sameMaterials(env.materials, m_materials) && env.subcell == m_subcell;
+    // A frequency sweep records the response to a pulse from t = 0, so it always restarts.
+    // A radar first records the scene without its targets (calibration), then with them. Moving
+    // only the targets reuses the calibration; changing only processing settings re-processes.
+    const bool radar = env.radar.has_value() && result.backgroundMaterials.has_value();
+    RadarMonitor::Start radarStart = RadarMonitor::Start::Calibrate;
+    std::vector<double> signature;
+    if (radar) {
+        signature = radarSignature(env);
+        const bool sameBackground = m_radarCalibrated && m_hasScene && !newScene && signature == m_radarSignature &&
+                                    sameGrid(env.grid, m_gridConfig) &&
+                                    sameMaterials(*result.backgroundMaterials, m_radarBackground) &&
+                                    result.backgroundSubcell == m_radarBackgroundSubcell;
+        const bool sameScene = sameBackground && sameMaterials(env.materials, m_materials) && env.subcell == m_subcell;
+        radarStart = sameScene ? RadarMonitor::Start::Reprocess
+                               : (sameBackground ? RadarMonitor::Start::Measure : RadarMonitor::Start::Calibrate);
+    }
+    const bool keepFields = radar ? radarStart == RadarMonitor::Start::Reprocess
+                                  : m_hasScene && !newScene && sameGrid(env.grid, m_gridConfig) &&
+                                        sameMaterials(env.materials, m_materials) && env.subcell == m_subcell && !env.sweep;
     if (!keepFields) {
         grid.configure(env.grid);
-        grid.uploadMaterials(env.materials, env.subcell);
+        if (radar && radarStart == RadarMonitor::Start::Calibrate)
+            grid.uploadMaterials(*result.backgroundMaterials, result.backgroundSubcell);
+        else
+            grid.uploadMaterials(env.materials, env.subcell);
         m_gridConfig = grid.config();
         m_materials = std::move(env.materials);
         m_subcell = env.subcell;
     }
+    if (radar && radarStart == RadarMonitor::Start::Calibrate) {
+        m_radarBackground = std::move(*result.backgroundMaterials);
+        m_radarBackgroundSubcell = result.backgroundSubcell;
+        m_radarSignature = signature;
+        m_radarCalibrated = false;
+    }
+    if (!radar) m_radarCalibrated = false;
     grid.setSources(env.sources);
-    m_gpu->instruments.configure(grid, env, result.outputDir, result.warnings);
+    m_gpu->instruments.configure(grid, env, result.outputDir, result.warnings, radarStart);
+    m_gpu->instruments.takeSnapshot(grid);
+    m_warnings = result.warnings;
     m_params = std::move(result.params);
     m_hasScene = true;
     m_sceneName = env.name;
+    m_description = env.description;
+    m_cellSize = env.cellSize;
+    m_referenceWavelength = env.referenceWavelength;
     if (newScene) applyView(env);
 
     for (const std::string& w : result.warnings) std::fprintf(stderr, "  warning: %s\n", w.c_str());
@@ -517,7 +595,8 @@ void Application::printHelp() const {
         "  [ / ]          steps per frame   - / +  visual gain          M  render mode\n"
         "  V              signed-mode axis  K / L  cutaway (z) down/up  O  overlay  H  half-res\n"
         "  F3 / F4        ray step size     Tab  select probe  Arrows/PgUp/PgDn  move probe (Shift x5)\n"
-        "  P              print measurement report      F12 screenshot   F1 help   Esc quit\n"
+        "  P              print measurement report to the console      F12 screenshot   Esc quit\n"
+        "  F1             help window       F2  show / hide the on-screen panels\n"
         "  Script parameters use the keys listed under 'Parameters' (from: %s)\n\n",
         ScriptEngine::kParamKeys);
     printParams();
@@ -585,7 +664,7 @@ void Application::handleKey(const SDL_KeyboardEvent& k) {
                       std::printf("Ray step: %.2f voxels\n", m_render.stepVoxels); return;
         case SDLK_F4: m_render.stepVoxels = std::min(m_render.stepVoxels * 1.25f, 4.0f);
                       std::printf("Ray step: %.2f voxels\n", m_render.stepVoxels); return;
-        case SDLK_TAB: inst.selectNextProbe(); inst.measure(m_gpu->grid); inst.printReport(m_gpu->grid); return;
+        case SDLK_TAB: inst.selectNextProbe(); inst.measure(m_gpu->grid); inst.takeSnapshot(m_gpu->grid); return;
         case SDLK_LEFT:     inst.moveSelectedProbe({-probeStep, 0.0f, 0.0f}, gs); return;
         case SDLK_RIGHT:    inst.moveSelectedProbe({+probeStep, 0.0f, 0.0f}, gs); return;
         case SDLK_DOWN:     inst.moveSelectedProbe({0.0f, -probeStep, 0.0f}, gs); return;
@@ -595,11 +674,13 @@ void Application::handleKey(const SDL_KeyboardEvent& k) {
         case SDLK_P:
             inst.measure(m_gpu->grid);
             inst.evaluateFarField(m_gpu->grid);
+            if (inst.hasSweep()) inst.evaluateSweep(m_gpu->grid);
             inst.printReport(m_gpu->grid);
             if (inst.hasPorts()) inst.printAllPorts(m_gpu->grid);
             return;
         case SDLK_F12: m_screenshotRequested = true; return;
-        case SDLK_F1: printHelp(); return;
+        case SDLK_F1: m_showHelp = !m_showHelp; return;
+        case SDLK_F2: m_ui->toggleVisible(); return;
         default: break;
     }
 
@@ -617,6 +698,7 @@ void Application::handleKey(const SDL_KeyboardEvent& k) {
 }
 
 void Application::handleEvent(const SDL_Event& e) {
+    if (m_ui && m_ui->processEvent(e)) return; // typing in a field, dragging a panel or a plot
     switch (e.type) {
         case SDL_EVENT_QUIT: m_running = false; break;
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -711,12 +793,219 @@ void Application::saveScreenshot(const std::string& path) const {
 }
 
 // -----------------------------------------------------------------------------
+// On-screen panels
+// -----------------------------------------------------------------------------
+void Application::drawUi() {
+    m_ui->beginFrame();
+    if (m_ui->visible()) {
+        drawScenePanel();
+        m_gpu->instruments.drawUi(*m_ui, m_refreshSeconds);
+        if (m_showHelp) drawHelpWindow();
+    }
+    m_ui->endFrame();
+}
+
+void Application::drawScenePanel() {
+    const float k = m_ui->scale();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 10.0f * k, vp->WorkPos.y + 10.0f * k), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(400.0f * k, 0.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Scene")) {
+        ImGui::End();
+        return;
+    }
+    const ImVec4 dim{0.62f, 0.66f, 0.74f, 1.0f}, warn{1.0f, 0.78f, 0.3f, 1.0f}, bad{1.0f, 0.42f, 0.38f, 1.0f};
+    const SimulationGrid& grid = m_gpu->grid;
+
+    ImGui::TextWrapped("%s", m_sceneName.c_str());
+    if (!m_scriptPath.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(dim, "(%s)", m_scriptPath.filename().string().c_str());
+    }
+    if (!m_scriptErrorText.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, bad);
+        ImGui::TextWrapped("SCRIPT ERROR: %s", m_scriptErrorText.c_str());
+        ImGui::PopStyleColor();
+        ImGui::TextColored(dim, "Fix the script and save it (hot reload), or press F5.");
+    }
+    for (const std::string& w : m_warnings) {
+        ImGui::PushStyleColor(ImGuiCol_Text, warn);
+        ImGui::TextWrapped("warning: %s", w.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!m_description.empty() && ImGui::CollapsingHeader("Description")) {
+        ImGui::PushStyleColor(ImGuiCol_Text, dim);
+        ImGui::TextWrapped("%s", m_description.c_str());
+        ImGui::PopStyleColor();
+    }
+    const glm::ivec3 s = grid.size();
+    ImGui::TextColored(dim, "grid %dx%dx%d (%.1f M cells, %.0f MB), %.3g mm cells", s.x, s.y, s.z,
+                       static_cast<double>(s.x) * s.y * s.z * 1e-6, static_cast<double>(grid.gpuMemoryBytes()) / (1 << 20),
+                       m_cellSize * 1e3);
+    ImGui::TextColored(dim, "reference wavelength %.1f cells = %.4g GHz", m_referenceWavelength,
+                       299792458.0 / (m_referenceWavelength * m_cellSize) * 1e-9);
+
+    ImGui::Separator();
+    ImGui::Text("t = %.1f  (%.1f periods)   %.0f fps", grid.time(), grid.time() / std::max(m_referenceWavelength, 1.0f), m_fps);
+    ImGui::TextColored(dim, "GPU: simulation %.2f ms, rendering %.2f ms per frame", m_gpu->simTimer.milliseconds(),
+                       m_gpu->renderTimer.milliseconds());
+    if (ImGui::Button(m_paused ? "Resume" : "Pause")) m_paused = !m_paused;
+    ImGui::SameLine();
+    if (ImGui::Button("Step") && m_paused) m_singleStep = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Reset fields")) {
+        m_gpu->grid.resetFields();
+        m_gpu->instruments.resetHistory(m_gpu->grid);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload")) reloadWithParams();
+    ImGui::SetNextItemWidth(160.0f * k);
+    ImGui::SliderInt("steps / frame", &m_stepsPerFrame, 1, 64);
+
+    // Parameters: the same values as the script's keys; changing one re-runs the script.
+    if (!m_params.empty() && ImGui::CollapsingHeader("Parameters", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool reload = false;
+        for (ScriptParam& p : m_params) {
+            ImGui::PushID(p.name.c_str());
+            ImGui::SetNextItemWidth(170.0f * k);
+            switch (p.type) {
+                case ScriptParam::Type::Bool: {
+                    bool v = p.value != 0.0;
+                    if (ImGui::Checkbox(p.label.c_str(), &v)) {
+                        p.value = v ? 1.0 : 0.0;
+                        reload = true;
+                    }
+                    break;
+                }
+                case ScriptParam::Type::Choice: {
+                    if (ImGui::BeginCombo(p.label.c_str(), p.valueString().c_str())) {
+                        for (size_t i = 0; i < p.choices.size(); ++i)
+                            if (ImGui::Selectable(p.choices[i].c_str(), i == p.choiceIndex) && i != p.choiceIndex) {
+                                p.choiceIndex = i;
+                                reload = true;
+                            }
+                        ImGui::EndCombo();
+                    }
+                    break;
+                }
+                case ScriptParam::Type::Number: {
+                    const bool bounded = p.min > -1e299 && p.max < 1e299;
+                    const bool integral = std::abs(p.step - std::round(p.step)) < 1e-9 && std::abs(p.min - std::round(p.min)) < 1e-9;
+                    const char* fmt = integral ? "%.0f" : "%.4g";
+                    double v = p.value;
+                    if (bounded) {
+                        ImGui::SliderScalar(p.label.c_str(), ImGuiDataType_Double, &v, &p.min, &p.max, fmt);
+                    } else {
+                        ImGui::InputDouble(p.label.c_str(), &v, p.step, p.step * 5.0, fmt);
+                    }
+                    if (v != p.value) {
+                        // Snap to the parameter's step, measured from its minimum (or zero).
+                        const double origin = bounded ? p.min : 0.0;
+                        if (p.step > 0.0) v = origin + std::round((v - origin) / p.step) * p.step;
+                        if (bounded) v = std::clamp(v, p.min, p.max);
+                        p.value = v;
+                    }
+                    // Re-run the script when the slider is released (not on every pixel of a drag).
+                    if (ImGui::IsItemDeactivatedAfterEdit()) reload = true;
+                    break;
+                }
+            }
+            std::string keys;
+            if (p.keyToggle) keys = "[" + keyName(p.keyToggle) + "]";
+            if (p.keyDecrease) keys = "[" + keyName(p.keyDecrease) + " " + keyName(p.keyIncrease) + "]";
+            if (!keys.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored(dim, "%s", keys.c_str());
+            }
+            ImGui::PopID();
+        }
+        if (reload) reloadWithParams();
+    }
+
+    if (ImGui::CollapsingHeader("View")) {
+        const int n = static_cast<int>(RenderSettings::Mode::Count);
+        int mode = static_cast<int>(m_render.mode);
+        ImGui::SetNextItemWidth(170.0f * k);
+        if (ImGui::BeginCombo("render mode [M]", RenderSettings::modeName(m_render.mode))) {
+            for (int i = 0; i < n; ++i)
+                if (ImGui::Selectable(RenderSettings::modeName(static_cast<RenderSettings::Mode>(i)), i == mode))
+                    m_render.mode = static_cast<RenderSettings::Mode>(i);
+            ImGui::EndCombo();
+        }
+        float gain = m_render.gainE;
+        ImGui::SetNextItemWidth(170.0f * k);
+        if (ImGui::SliderFloat("visual gain [- +]", &gain, 0.1f, 2000.0f, "%.3g", ImGuiSliderFlags_Logarithmic) && gain > 0.0f) {
+            m_render.gainB *= gain / m_render.gainE;
+            m_render.gainE = gain;
+        }
+        ImGui::Checkbox("overlay [O]", &m_render.showOverlay);
+        ImGui::SameLine();
+        ImGui::Checkbox("help [F1]", &m_showHelp);
+        ImGui::SetNextItemWidth(120.0f * k);
+        const float rates[4] = {0.25f, 0.5f, 1.0f, 2.0f};
+        char current[16];
+        std::snprintf(current, sizeof(current), "%.2g s", static_cast<double>(m_refreshSeconds));
+        if (ImGui::BeginCombo("readout refresh", current)) {
+            for (float r : rates) {
+                char label[16];
+                std::snprintf(label, sizeof(label), "%.2g s", static_cast<double>(r));
+                if (ImGui::Selectable(label, r == m_refreshSeconds)) m_refreshSeconds = r;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TextColored(dim, "F2 hides all panels.");
+    }
+    ImGui::End();
+}
+
+void Application::drawHelpWindow() {
+    const float k = m_ui->scale();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                            ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(620.0f * k, 0.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Help", &m_showHelp)) {
+        ImGui::End();
+        return;
+    }
+    static const char* rows[][2] = {
+        {"1-9, 0", "load bundled scene 1..10"},          {"F6 / F7", "previous / next scene"},
+        {"F5", "reload the script (also automatic on save; drag & drop a .lua to open)"},
+        {"LMB drag", "orbit / look"},                    {"RMB / MMB drag", "pan"},
+        {"wheel", "zoom"},                               {"C", "orbit / fly camera (fly: WASD, Q/E, Shift fast)"},
+        {"Space", "pause / resume"},                     {"N", "single step (paused)"},
+        {"R", "reset fields"},                           {"[ / ]", "steps per frame"},
+        {"- / +", "visual gain"},                        {"M", "render mode"},
+        {"V", "signed-mode axis"},                       {"K / L", "cutaway (z) down / up"},
+        {"O", "overlay"},                                {"H", "half-resolution rendering"},
+        {"F3 / F4", "ray step size"},                    {"Tab", "select probe"},
+        {"Arrows, PgUp/PgDn", "move the selected probe (Shift x5)"},
+        {"P", "print the full measurement report to the console"},
+        {"F1", "this help"},                             {"F2", "show / hide the panels"},
+        {"F12", "screenshot"},                           {"Esc", "quit"},
+    };
+    if (ImGui::BeginTable("help", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+        for (const auto& r : rows) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "%s", r[0]);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(r[1]);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextWrapped("Script parameters are listed in the Scene panel with their keys (from: %s). Hover over a "
+                       "table header for an explanation of the quantity.", ScriptEngine::kParamKeys);
+    ImGui::End();
+}
+
+// -----------------------------------------------------------------------------
 // Main loop
 // -----------------------------------------------------------------------------
 int Application::run() {
     Uint64 last = SDL_GetPerformanceCounter();
     const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
-    double titleTimer = 0.0, reportTimer = 0.0, farFieldTimer = 0.0;
+    double titleTimer = 0.0, farFieldTimer = 0.0, snapshotTimer = 0.0;
     int framesSinceTitle = 0;
     SimulationGrid& grid = m_gpu->grid;
     Instruments& inst = m_gpu->instruments;
@@ -746,12 +1035,24 @@ int Application::run() {
             m_gpu->simTimer.end();
         }
 
+        // ---- radar: swap in the targets once the calibration pass is recorded ------
+        if (inst.hasRadar()) {
+            inst.radarUpdate();
+            if (inst.radarCalibrationComplete()) {
+                grid.uploadMaterials(m_materials, m_subcell);
+                grid.resetFields();
+                inst.radarBeginMeasurement(grid);
+                m_radarCalibrated = true;
+            }
+        }
+
         // ---- measure (readbacks are small but synchronous: throttle) ----------
         if (m_frame % 2 == 0 || steps == 0) inst.measure(grid);
         farFieldTimer += dt;
         if (inst.needsEveryStep() && (farFieldTimer > 1.0 || (m_opt.frames > 0 && m_frame % 50 == 49))) {
             farFieldTimer = 0.0;
             inst.evaluateFarField(grid);
+            if (inst.hasSweep()) inst.evaluateSweep(grid);
         }
 
         // ---- render ----------------------------------------------------------
@@ -764,6 +1065,14 @@ int Application::run() {
             m_gpu->renderer.drawLines(m_camera, m_overlay);
         }
         m_gpu->renderTimer.end();
+
+        // ---- on-screen panels (readouts refresh at a fixed interval) ------------------------
+        snapshotTimer += dt;
+        if (snapshotTimer >= m_refreshSeconds) {
+            snapshotTimer = 0.0;
+            inst.takeSnapshot(grid);
+        }
+        drawUi();
 
         const bool lastSelfTestFrame = m_opt.frames > 0 && m_frame + 1 >= static_cast<std::uint64_t>(m_opt.frames);
         if (m_screenshotRequested) {
@@ -780,21 +1089,20 @@ int Application::run() {
         ++m_frame;
         ++framesSinceTitle;
         titleTimer += dt;
-        reportTimer += dt;
         if (titleTimer >= 0.25) {
-            updateTitle(framesSinceTitle / titleTimer);
+            m_fps = framesSinceTitle / titleTimer;
+            updateTitle(m_fps);
             titleTimer = 0.0;
             framesSinceTitle = 0;
         }
         const bool selfTest = m_opt.frames > 0;
-        // Periodic reports only when there is something to report (P always prints).
-        if ((!selfTest && reportTimer >= 2.0) || (selfTest && m_frame % 100 == 0)) {
-            if (!inst.empty()) inst.printReport(grid);
-            reportTimer = 0.0;
-        }
+        // Interactive runs show the readouts on screen (P prints them to the console);
+        // unattended --frames runs print a periodic report instead.
+        if (selfTest && m_frame % 100 == 0 && !inst.empty()) inst.printReport(grid);
         if (selfTest && m_frame >= static_cast<std::uint64_t>(m_opt.frames)) {
             inst.measure(grid);
             inst.evaluateFarField(grid);
+            if (inst.hasSweep()) inst.evaluateSweep(grid);
             if (!inst.empty()) inst.printReport(grid);
             std::printf("GPU timings: sim %.3f ms/frame (%d steps), render %.3f ms\n", m_gpu->simTimer.milliseconds(),
                         m_stepsPerFrame, m_gpu->renderTimer.milliseconds());

@@ -13,7 +13,8 @@ namespace {
 constexpr double kEta0 = 376.730313668;
 } // namespace
 
-Instruments::Instruments(const fs::path& shaderDir) : m_analyzer(shaderDir), m_farField(shaderDir), m_ports(shaderDir) {}
+Instruments::Instruments(const fs::path& shaderDir)
+    : m_analyzer(shaderDir), m_farField(shaderDir), m_ports(shaderDir), m_radar(shaderDir) {}
 
 std::unique_ptr<std::ofstream> Instruments::openLog(const std::string& path, const char* header,
                                                     std::vector<std::string>& warnings) const {
@@ -32,7 +33,7 @@ std::unique_ptr<std::ofstream> Instruments::openLog(const std::string& path, con
 }
 
 void Instruments::configure(const SimulationGrid& grid, const Environment& env, const fs::path& outputDir,
-                            std::vector<std::string>& warnings) {
+                            std::vector<std::string>& warnings, RadarMonitor::Start radarStart) {
     m_outputDir = outputDir;
     m_averagingTime = 3.0 * std::max(env.referenceWavelength, 2.0f);
     m_unstable = false;
@@ -56,15 +57,41 @@ void Instruments::configure(const SimulationGrid& grid, const Environment& env, 
     }
 
     m_wires = env.wires;
+    m_sheets = env.sheets;
     m_ports.disable();
     if (!env.ports.empty()) {
-        m_ports.configure(grid, env.ports, env.farField ? env.farField->averagingPeriods : 4.0f);
+        std::optional<SweepSetup> sweep = env.sweep;
+        if (sweep && !sweep->logPath.empty()) {
+            fs::path p(sweep->logPath);
+            if (p.is_relative()) p = m_outputDir / p;
+            std::error_code ec;
+            if (p.has_parent_path()) fs::create_directories(p.parent_path(), ec);
+            sweep->logPath = p.string();
+        }
+        m_ports.configure(grid, env.ports, env.farField ? env.farField->averagingPeriods : 4.0f, sweep, env.cellSize);
+        detectArrayLayout();
         for (const PortSetup& p : env.ports)
             if (std::abs(p.wavelength - env.ports.front().wavelength) > 1e-3f) {
                 warnings.push_back("ports drive different frequencies; impedances are evaluated at the first "
                                    "port's wavelength");
                 break;
             }
+    }
+
+    if (env.radar && !env.ports.empty()) {
+        RadarSetup r = *env.radar;
+        if (!r.logPath.empty()) {
+            fs::path p(r.logPath);
+            if (p.is_relative()) p = m_outputDir / p;
+            std::error_code ec;
+            if (p.has_parent_path()) fs::create_directories(p.parent_path(), ec);
+            r.logPath = p.string();
+        }
+        m_radar.configure(grid, r, env.ports, env.sources, env.ports.front().wavelength, env.cellSize, env.targets,
+                          radarStart, warnings);
+    } else {
+        if (env.radar) warnings.push_back("radar: the scene has no antenna feeds to transmit and receive with");
+        m_radar.disable();
     }
 
     m_farField.disable();
@@ -86,12 +113,56 @@ void Instruments::configure(const SimulationGrid& grid, const Environment& env, 
     }
 }
 
+// Ports whose feeds share an axis and sit on a full rectangular lattice across the other two
+// axes form an array: the UI then shows a per-element map (active VSWR and friends).
+void Instruments::detectArrayLayout() {
+    m_arrayRows = m_arrayCols = 0;
+    m_arrayIndex.clear();
+    const auto& ports = m_ports.ports();
+    if (ports.size() < 4) return;
+    const int ax = ports.front().axis;
+    for (const PortSetup& p : ports)
+        if (p.axis != ax) return;
+    const int u = ax == 0 ? 1 : 0, v = ax == 2 ? 1 : 2;
+    std::vector<int> us, vs;
+    for (const PortSetup& p : ports) {
+        us.push_back(p.texel[u]);
+        vs.push_back(p.texel[v]);
+    }
+    auto unique = [](std::vector<int> a) {
+        std::sort(a.begin(), a.end());
+        a.erase(std::unique(a.begin(), a.end()), a.end());
+        return a;
+    };
+    const std::vector<int> cu = unique(us), cv = unique(vs);
+    if (cu.size() < 2 || cv.size() < 2 || cu.size() * cv.size() != ports.size()) return;
+    m_arrayCols = static_cast<int>(cu.size());
+    m_arrayRows = static_cast<int>(cv.size());
+    m_arrayIndex.assign(ports.size(), -1);
+    for (size_t i = 0; i < ports.size(); ++i) {
+        const int c = static_cast<int>(std::lower_bound(cu.begin(), cu.end(), us[i]) - cu.begin());
+        const int r = m_arrayRows - 1 - static_cast<int>(std::lower_bound(cv.begin(), cv.end(), vs[i]) - cv.begin());
+        int& slot = m_arrayIndex[static_cast<size_t>(r * m_arrayCols + c)];
+        if (slot >= 0) { // two ports on one lattice site: not a simple array
+            m_arrayRows = m_arrayCols = 0;
+            m_arrayIndex.clear();
+            return;
+        }
+        slot = static_cast<int>(i);
+    }
+    m_arrayAxes[0] = "xyz"[u];
+    m_arrayAxes[1] = "xyz"[v];
+}
+
 void Instruments::onStep(const SimulationGrid& grid) {
     m_farField.accumulate(grid);
     m_ports.accumulate(grid);
+    m_radar.accumulate(grid);
 }
 
 void Instruments::evaluatePorts() { m_ports.evaluate(); }
+
+void Instruments::evaluateSweep(const SimulationGrid& grid) { m_ports.evaluateSweep(grid.dt()); }
 
 void Instruments::resetHistory(const SimulationGrid& grid) {
     for (Flux& f : m_fluxes) {
@@ -101,8 +172,11 @@ void Instruments::resetHistory(const SimulationGrid& grid) {
     if (m_farField.enabled()) m_farField.configure(grid, m_farField.setup());
     if (m_ports.enabled()) {
         const std::vector<PortSetup> ports = m_ports.ports();
-        m_ports.configure(grid, ports, m_farField.enabled() ? m_farField.setup().averagingPeriods : 4.0f);
+        const std::optional<SweepSetup> sweep = m_ports.sweepSetup();
+        m_ports.configure(grid, ports, m_farField.enabled() ? m_farField.setup().averagingPeriods : 4.0f, sweep,
+                          m_ports.cellSize());
     }
+    m_radar.restart(grid);
     m_unstable = false;
 }
 
@@ -162,9 +236,12 @@ void Instruments::printPorts(const SimulationGrid& grid, size_t maxLines) const 
         accepted += rd[i].acceptedPower;
         available += rd[i].availablePower;
     }
-    if (periods < 12.0)
+    // A frequency sweep drives the ports with a pulse: the single-frequency (continuous-wave)
+    // readings are meaningless then, so only the sweep summary below is reported.
+    const size_t cwLines = (m_ports.sweeping() || m_radar.enabled()) ? 0 : maxLines;
+    if (periods < 12.0 && cwLines > 0)
         std::printf("    ports: averaging (%.0f of ~12 periods), impedances still settling\n", periods);
-    for (size_t i = 0; i < ports.size() && i < maxLines; ++i) {
+    for (size_t i = 0; i < ports.size() && i < cwLines; ++i) {
         const PortSetup& p = ports[i];
         const PortReading& r = rd[i];
         if (!r.valid) {
@@ -181,9 +258,36 @@ void Instruments::printPorts(const SimulationGrid& grid, size_t maxLines) const 
             std::printf("    port  %-14s Z = %7.1f %+7.1fj ohm | current feed %.3g | P_acc %.3e\n", p.name.c_str(),
                         r.zOhm.real(), r.zOhm.imag(), static_cast<double>(p.drive), r.acceptedPower);
     }
-    if (ports.size() > maxLines)
+    if (cwLines > 0 && ports.size() > maxLines)
         std::printf("    ... %zu more ports (press P for all) | total P_acc %.3e of %.3e available\n",
                     ports.size() - maxLines, accepted, available);
+
+    // Frequency sweep summary.
+    if (m_ports.sweeping()) {
+        const SweepResult& sw = m_ports.sweep();
+        const double cell = m_ports.cellSize();
+        auto ghz = [cell](double wl) { return 299792458.0 / (wl * cell) * 1e-9; };
+        if (!sw.valid) {
+            std::printf("    sweep: recording the pulse response...\n");
+        } else {
+            std::printf("    sweep: %zu steps recorded, ring-down %.1e of peak%s\n", sw.samples, sw.residual,
+                        sw.residual > 1e-3 ? (sw.full ? " (buffer full: results approximate)" : " (still ringing: results settling)") : " (settled)");
+            for (size_t i = 0; i < sw.ports.size() && i < maxLines; ++i) {
+                const PortSweep& ps = sw.ports[i];
+                const SweepPoint& b = ps.points[ps.best];
+                std::printf("    sweep %-12s best match %.4f GHz (lambda %.2f cells): S11 %.1f dB, VSWR %.2f, Z = %.1f %+.1fj ohm",
+                            ports[i].name.c_str(), ghz(ps.bestWavelength), ps.bestWavelength, b.s11Db, b.vswr,
+                            b.zOhm.real(), b.zOhm.imag());
+                if (ps.hasBand) {
+                    const double f0 = ghz(ps.bestWavelength), fl = ghz(ps.bandLowWavelength), fh = ghz(ps.bandHighWavelength);
+                    std::printf(" | -10 dB band %.4f-%.4f GHz (%.1f%%)", fl, fh, 100.0 * (fh - fl) / f0);
+                } else {
+                    std::printf(" | never below -10 dB in the sweep");
+                }
+                std::printf("\n");
+            }
+        }
+    }
 
     // Radiation resistance and efficiency from the far-field power.
     if (m_farField.enabled() && m_farField.pattern().valid && accepted > 0.0) {
@@ -195,6 +299,37 @@ void Instruments::printPorts(const SimulationGrid& grid, size_t maxLines) const 
         } else {
             std::printf("    radiation efficiency P_rad / total P_acc = %.0f%%\n", 100.0 * prad / accepted);
         }
+    }
+}
+
+void Instruments::printRadar() const {
+    if (!m_radar.enabled()) return;
+    const RadarImage& img = m_radar.image();
+    switch (m_radar.phase()) {
+        case RadarMonitor::Phase::Calibrating:
+            std::printf("    radar: calibrating without the targets (%.0f%% of %zu steps)\n", 100.0 * m_radar.progress(),
+                        m_radar.recordSteps());
+            return;
+        case RadarMonitor::Phase::Measuring:
+            std::printf("    radar: measuring (%.0f%% of %zu steps)\n", 100.0 * m_radar.progress(), m_radar.recordSteps());
+            return;
+        default: break;
+    }
+    if (!img.valid) {
+        std::printf("    radar: no image\n");
+        return;
+    }
+    const double cell = m_radar.cellSize() * 1e3;
+    std::printf("    radar: strongest echo %.1f dB below the transmit pulse at an element, image floor %.1f dB, "
+                "%zu detection(s)\n", -img.echoDb, img.floorDb, img.detections.size());
+    for (size_t k = 0; k < img.detections.size(); ++k) {
+        const RadarDetection& d = img.detections[k];
+        std::printf("      #%zu range %6.1f mm (%5.2f lambda)  az %+5.1f  el %+5.1f deg  %+6.1f dB (%.1f dB above floor)",
+                    k + 1, d.range * cell, d.range / m_radar.wavelength(), d.azDeg, d.elDeg, d.relDb, d.snrDb);
+        if (d.target >= 0)
+            std::printf(" | %s: front at %.1f mm, az %+.1f, el %+.1f", m_radar.targets()[static_cast<size_t>(d.target)].name.c_str(),
+                        d.targetRange * cell, d.targetAzDeg, d.targetElDeg);
+        std::printf("\n");
     }
 }
 
@@ -218,6 +353,7 @@ void Instruments::printReport(const SimulationGrid& grid) const {
                     f.reading.instantaneous, f.reading.timeAveraged, f.reading.peakAbs);
 
     printPorts(grid, 4);
+    printRadar();
 
     if (m_farField.enabled()) {
         const FarFieldPattern& pat = m_farField.pattern();
@@ -259,7 +395,15 @@ std::string Instruments::titleSummary() const {
                       m_fluxes.front().reading.timeAveraged);
         s += buf;
     }
-    if (m_ports.enabled() && !m_ports.readings().empty() && m_ports.readings().front().valid) {
+    if (m_ports.sweeping()) {
+        const SweepResult& sw = m_ports.sweep();
+        if (sw.valid && !sw.ports.empty()) {
+            const PortSweep& ps = sw.ports.front();
+            const double ghz = 299792458.0 / (ps.bestWavelength * m_ports.cellSize()) * 1e-9;
+            std::snprintf(buf, sizeof(buf), " | best match %.3f GHz, S11 %.1f dB", ghz, ps.points[ps.best].s11Db);
+            s += buf;
+        }
+    } else if (m_ports.enabled() && !m_ports.readings().empty() && m_ports.readings().front().valid) {
         const PortReading& r = m_ports.readings().front();
         std::snprintf(buf, sizeof(buf), " | Z=%.0f%+.0fj ohm VSWR %.2f", r.zOhm.real(), r.zOhm.imag(), r.vswr);
         s += buf;
@@ -291,6 +435,27 @@ void Instruments::appendOverlay(std::vector<LineVertex>& out, const glm::ivec3& 
         out.push_back({W(w.a), wireColor});
         out.push_back({W(w.b), wireColor});
     }
+    // Zero-thickness sheets: outline plus a light hatch so the surface reads as metal.
+    const glm::vec4 sheetColor{0.85f, 0.75f, 0.45f, 0.9f}, hatchColor{0.85f, 0.75f, 0.45f, 0.35f};
+    for (const SheetRect& s : m_sheets) {
+        int n = 0;
+        for (int i = 0; i < 3; ++i)
+            if (s.a[i] == s.b[i]) n = i;
+        const int u = (n + 1) % 3, v = (n + 2) % 3;
+        auto corner = [&](float cu, float cv) { glm::vec3 p = s.a; p[u] = cu; p[v] = cv; return W(p); };
+        const glm::vec3 q[4] = {corner(s.a[u], s.a[v]), corner(s.b[u], s.a[v]), corner(s.b[u], s.b[v]), corner(s.a[u], s.b[v])};
+        for (int i = 0; i < 4; ++i) {
+            out.push_back({q[i], sheetColor});
+            out.push_back({q[(i + 1) % 4], sheetColor});
+        }
+        const float spanU = s.b[u] - s.a[u];
+        const int hatches = std::max(1, static_cast<int>(spanU / 3.0f));
+        for (int h = 1; h < hatches; ++h) {
+            const float cu = s.a[u] + spanU * static_cast<float>(h) / static_cast<float>(hatches);
+            out.push_back({corner(cu, s.a[v]), hatchColor});
+            out.push_back({corner(cu, s.b[v]), hatchColor});
+        }
+    }
 
     for (size_t i = 0; i < m_probes.size(); ++i) {
         const bool sel = i == m_selected;
@@ -321,6 +486,20 @@ void Instruments::appendOverlay(std::vector<LineVertex>& out, const glm::ivec3& 
             out.push_back({q[i], fluxColor});
             out.push_back({q[(i + 1) % 4], fluxColor});
         }
+    }
+
+    if (m_radar.enabled()) {
+        const glm::vec4 targetColor{1.0f, 0.55f, 0.2f, 0.45f}, hitColor{1.0f, 0.25f, 0.25f, 0.95f};
+        for (const TargetInfo& t : m_radar.targets()) VolumeRenderer::appendBox(out, W(t.min), W(t.max), targetColor);
+        const glm::vec3 tx = m_radar.txCenter();
+        VolumeRenderer::appendCross(out, W(tx), 3.0f * voxel, {0.5f, 1.0f, 0.5f, 0.9f});
+        const RadarImage& img = m_radar.image();
+        if (img.valid && m_radar.phase() == RadarMonitor::Phase::Done)
+            for (const RadarDetection& d : img.detections) {
+                VolumeRenderer::appendCross(out, W(d.position), 6.0f * voxel, hitColor);
+                out.push_back({W(tx), {1.0f, 0.25f, 0.25f, 0.35f}});
+                out.push_back({W(d.position), {1.0f, 0.25f, 0.25f, 0.35f}});
+            }
     }
 
     if (!m_farField.enabled()) return;

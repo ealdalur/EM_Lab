@@ -49,6 +49,11 @@ struct FarFieldPattern {
     float maxDirectivityDbi = -100.0f;
     glm::vec3 maxDirection{1, 0, 0};
     std::vector<PatternCut> cuts;
+    // Beam maps: directivity (dBi) on a mapSize x mapSize grid of direction cosines
+    // u = sin(theta) cos(phi), v = sin(theta) sin(phi) for the upper (+z) and lower hemispheres.
+    // Row-major, row 0 at v = +1, column 0 at u = -1; directions outside the unit circle hold -120.
+    int mapSize = 0;
+    std::vector<float> mapUpperDbi, mapLowerDbi;
 };
 
 class FarFieldMonitor {
@@ -84,7 +89,8 @@ private:
     FarFieldSetup m_setup;
     int m_faceOffset[7] = {};
     int m_pointCount = 0;
-    int m_sphereBegin = 0; // index of the first sphere-sampling direction
+    int m_sphereBegin = 0; // index of the first beam-map direction
+    std::vector<int> m_mapIndex; // beam-map cell -> direction index (-1 outside the unit circle)
     std::vector<glm::vec4> m_dirs;
     double m_startTime = 0.0;
 

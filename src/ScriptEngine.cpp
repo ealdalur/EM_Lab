@@ -132,6 +132,8 @@ struct Context {
     // Monopole feeds must touch a conductor at their base (checked once the scene is built).
     std::vector<MonopoleCheck> monopoles;
     std::vector<ThinWireSpec> thinWires;
+    // Radar calibration: the second run of a radar scene leaves out every target = true object.
+    bool withTargets = true;
 };
 
 thread_local Context* g_ctx = nullptr;
@@ -792,17 +794,53 @@ int api_param(lua_State* L) {
 // =============================================================================
 // Geometry
 // =============================================================================
+// A radar target: its bounds and the centres of its cells (subsampled for big objects), so the
+// radar can compare detections with the true nearest surface and direction.
+TargetInfo targetInfo(const Shape& shape, const std::string& name) {
+    TargetInfo t;
+    t.name = name;
+    const AABB b = shape.bounds();
+    const glm::ivec3 n = ctx().settings.size;
+    const glm::ivec3 lo = glm::clamp(glm::ivec3(glm::floor(b.min)), glm::ivec3(0), n - 1);
+    const glm::ivec3 hi = glm::clamp(glm::ivec3(glm::ceil(b.max)), glm::ivec3(0), n - 1);
+    const glm::vec3 span = glm::vec3(hi - lo + 1);
+    const int stride = std::max(1, static_cast<int>(std::ceil(std::cbrt(span.x * span.y * span.z / 200000.0f))));
+    glm::vec3 mn(1e30f), mx(-1e30f);
+    for (int z = lo.z; z <= hi.z; z += stride)
+        for (int y = lo.y; y <= hi.y; y += stride)
+            for (int x = lo.x; x <= hi.x; x += stride) {
+                const glm::vec3 p = glm::vec3(x, y, z) + 0.5f;
+                if (!shape.contains(p)) continue;
+                t.points.push_back(p);
+                mn = glm::min(mn, p - 0.5f);
+                mx = glm::max(mx, p + 0.5f);
+            }
+    if (t.points.empty()) {
+        t.min = b.min;
+        t.max = b.max;
+    } else {
+        t.min = mn;
+        t.max = mx;
+    }
+    return t;
+}
+
 size_t fillShape(lua_State* L, const Args& a, ShapePtr local, const glm::vec3& center, const Material& m) {
     ShapePtr shape = local;
     if (auto rot = readRotation(a)) shape = std::make_shared<TransformedShape>(local, center, *rot);
     else shape = std::make_shared<TransformedShape>(local, center, glm::mat3(1.0f));
+    // Radar targets are recorded (for the truth comparison) and left out of the calibration run.
+    if (a.boolean("target", false)) {
+        builder(L).env().targets.push_back(targetInfo(*shape, a.str("name", a.what())));
+        if (!ctx().withTargets) return 0;
+    }
     const size_t n = builder(L).fill(*shape, m);
     fillReport(L, a, n);
     return n;
 }
 
 int api_box(lua_State* L) {
-    Args a(L, "box", {"min", "max", "center", "size", "material", "rotate", "thickness", "name"});
+    Args a(L, "box", {"min", "max", "center", "size", "material", "rotate", "thickness", "name", "target"});
     const auto [mn, mx] = readBox(a);
     const Material m = readMaterial(a, "metal");
     const glm::vec3 c = 0.5f * (mn + mx), h = 0.5f * (mx - mn);
@@ -818,7 +856,7 @@ int api_box(lua_State* L) {
 }
 
 int api_sphere(lua_State* L) {
-    Args a(L, "sphere", {"center", "radius", "material", "rotate", "thickness", "name"});
+    Args a(L, "sphere", {"center", "radius", "material", "rotate", "thickness", "name", "target"});
     const glm::vec3 c = a.vec("center", glm::vec3(ctx().settings.size) * 0.5f);
     const glm::vec3 r = a.reqVec("radius"); // number -> sphere, vector -> ellipsoid
     if (glm::any(glm::lessThanEqual(r, glm::vec3(0.0f)))) a.fail("radius must be > 0");
@@ -837,7 +875,7 @@ int api_sphere(lua_State* L) {
 
 int api_cylinder(lua_State* L) {
     Args a(L, "cylinder", {"center", "axis", "radius", "length", "material", "rotate", "thickness", "inner_radius",
-                           "capped", "name"});
+                           "capped", "name", "target"});
     const glm::vec3 c = a.vec("center", glm::vec3(ctx().settings.size) * 0.5f);
     const int axis = a.axis("axis", 2);
     const float r = static_cast<float>(a.positive("radius", 1.0));
@@ -991,7 +1029,7 @@ int api_frame(lua_State* L) {
 }
 
 int api_shape(lua_State* L) {
-    Args a(L, "shape", {"min", "max", "center", "size", "inside", "material", "name"});
+    Args a(L, "shape", {"min", "max", "center", "size", "inside", "material", "name", "target"});
     const auto [mn, mx] = readBox(a);
     if (a.push("inside") != LUA_TFUNCTION) {
         lua_pop(L, 1);
@@ -1014,6 +1052,14 @@ int api_shape(lua_State* L) {
         lua_pop(L, 1);
         return in;
     });
+    if (a.boolean("target", false)) {
+        builder(L).env().targets.push_back(targetInfo(shape, a.str("name", a.what())));
+        if (!ctx().withTargets) {
+            luaL_unref(L, LUA_REGISTRYINDEX, ref);
+            a.checkUnknown();
+            return 0;
+        }
+    }
     size_t n = 0;
     try {
         n = builder(L).fill(shape, m);
@@ -1287,9 +1333,8 @@ int api_monopole(lua_State* L) {
     const float sign = o[ax] >= 0.0f ? 1.0f : -1.0f;
     const float len = static_cast<float>(a.positive("length", 0.25 * s.wavelength));
     if (len < 2.0f) a.fail("length must be >= 2 cells (feed gap plus rod)");
-    if (len < 3.0f && lower(a.str("model", "thin")) != "rod")
-        a.fail("a thin-wire monopole needs length >= 3 cells (its free end is built one cell short to correct the "
-               "grid's end effect)");
+    // A 2-cell thin monopole is fine when its top joins a conductor (a patch probe); a free top
+    // end would be shortened to nothing by the end correction, which emitThinWires() reports.
     const int rod = std::max(1, static_cast<int>(std::lround(len)) - 1);
     if (std::abs(static_cast<float>(rod + 1) - len) >= 1.0f)
         warn(L, fmt("monopole: length %.1f realised as %d cells (1-cell feed gap + %d-cell conductor)", len, rod + 1, rod));
@@ -1342,6 +1387,66 @@ int api_wire(lua_State* L) {
     const int ax = d.x != 0 ? 0 : (d.y != 0 ? 1 : 2);
     addThinWire(L, p0, ax, std::min(p0[ax], p1[ax]), std::max(p0[ax], p1[ax]),
                 readRadius(a, ctx().settings.wavelength));
+    a.checkUnknown();
+    return 0;
+}
+
+// Zero-thickness perfectly conducting rectangle in a lattice plane (patch, microstrip,
+// ground foil): every E edge lying in the rectangle is a perfect conductor, no cells filled.
+int api_sheet(lua_State* L) {
+    Args a(L, "sheet", {"min", "max", "center", "size", "name"});
+    lock(L);
+    const auto [mn, mx] = readBox(a);
+    const glm::ivec3 lo = nodeOf(mn), hi = nodeOf(mx);
+    int normal = -1;
+    for (int i = 0; i < 3; ++i)
+        if (lo[i] == hi[i]) {
+            if (normal >= 0) a.fail("a sheet needs a non-zero extent along two axes (use wire{} for a line)");
+            normal = i;
+        }
+    if (normal < 0)
+        a.fail("a sheet has zero thickness: give min and max equal along its normal axis (e.g. min.z == max.z), "
+               "or a size with one zero component; use box{} for solid metal");
+    const int u = (normal + 1) % 3, v = (normal + 2) % 3;
+    Environment& env = builder(L).env();
+    for (int iu = lo[u]; iu <= hi[u]; ++iu)
+        for (int iv = lo[v]; iv <= hi[v]; ++iv) {
+            glm::ivec3 q = lo;
+            q[u] = iu;
+            q[v] = iv;
+            if (iu < hi[u]) env.subcell.edges.push_back({q, u, kPerfectEdgeSigma});
+            if (iv < hi[v]) env.subcell.edges.push_back({q, v, kPerfectEdgeSigma});
+        }
+    env.sheets.push_back({glm::vec3(lo), glm::vec3(hi)});
+    a.checkUnknown();
+    return 0;
+}
+
+// Frequency sweep of every antenna port. Drive the antennas with waveform = "pulse"; the
+// impedance, S11 and VSWR are computed at `points` frequencies between the band edges.
+int api_sweep(lua_State* L) {
+    Args a(L, "sweep", {"wavelengths", "frequencies", "points", "log", "name"});
+    lock(L);
+    const bool hasW = a.has("wavelengths"), hasF = a.has("frequencies");
+    if (hasW == hasF) a.fail("give the band as wavelengths = {lo, hi} (cells) or frequencies = {lo, hi} (Hz)");
+    const auto band = a.optVec2(hasW ? "wavelengths" : "frequencies");
+    if (!band || !(band->x > 0.0f) || !(band->y > 0.0f) || band->x == band->y)
+        a.fail("the band needs two different positive values");
+    SweepSetup s;
+    if (hasW) {
+        s.wavelengthMin = std::min(band->x, band->y);
+        s.wavelengthMax = std::max(band->x, band->y);
+    } else {
+        const double cell = ctx().settings.cellSize;
+        s.wavelengthMin = static_cast<float>(kC0 / (std::max(band->x, band->y) * cell));
+        s.wavelengthMax = static_cast<float>(kC0 / (std::min(band->x, band->y) * cell));
+    }
+    if (s.wavelengthMin < 6.0f)
+        warn(L, fmt("sweep: the band reaches %.1f cells per wavelength; below ~10 the results are inaccurate",
+                    s.wavelengthMin));
+    s.points = std::clamp(a.integer("points", 81), 2, 2001);
+    s.logPath = a.str("log", "");
+    builder(L).env().sweep = s;
     a.checkUnknown();
     return 0;
 }
@@ -1693,6 +1798,49 @@ int api_flux_box(lua_State* L) {
     return 0;
 }
 
+// Pulsed radar receiver on the antenna ports (digital beamforming, clutter calibration,
+// detection). Objects the radar should see are marked target = true.
+int api_radar(lua_State* L) {
+    Args a(L, "radar", {"range", "fov", "noise", "threshold", "dynamic_range", "reference", "phase_center", "tx", "taper",
+                        "log", "name"});
+    lock(L);
+    RadarSetup r;
+    if (auto rg = a.optVec2("range")) {
+        if (!(rg->x >= 0.0f) || !(rg->y > rg->x)) a.fail("range = {min, max} needs 0 <= min < max (cells)");
+        r.rangeMin = rg->x;
+        r.rangeMax = rg->y;
+    }
+    if (a.has("fov")) {
+        if (auto f = a.optNum("fov")) {
+            r.fovAzDeg = r.fovElDeg = static_cast<float>(*f);
+        } else if (auto f2 = a.optVec2("fov")) {
+            r.fovAzDeg = f2->x;
+            r.fovElDeg = f2->y;
+        }
+        if (!(r.fovAzDeg > 0.0f && r.fovAzDeg <= 80.0f && r.fovElDeg > 0.0f && r.fovElDeg <= 80.0f))
+            a.fail("fov = half-angle in degrees (0..80), or {azimuth, elevation}");
+    }
+    if (auto n = a.optNum("noise")) {
+        if (*n > 0.0) a.fail("noise is in dB relative to the transmit pulse at a port, so it must be negative (e.g. -70)");
+        r.noiseDb = static_cast<float>(*n);
+    }
+    r.thresholdDb = static_cast<float>(a.num("threshold", 13.0));
+    r.dynamicRangeDb = static_cast<float>(a.positive("dynamic_range", 25.0));
+    r.referenceDistance = static_cast<float>(a.num("reference", 0.0));
+    r.phaseCenterOffset = a.vec("phase_center", glm::vec3(0.0f));
+    r.txCenter = a.optVec("tx");
+    const std::string taper = lower(a.str("taper", "hamming"));
+    if (taper == "uniform" || taper == "none") r.taper = 0;
+    else if (taper == "hamming") r.taper = 1;
+    else if (taper == "hann" || taper == "hanning") r.taper = 2;
+    else a.fail("taper must be \"uniform\", \"hamming\" or \"hann\" (got \"%s\")", taper.c_str());
+    r.logPath = a.str("log", "");
+    if (builder(L).env().radar) warn(L, "radar: only one radar per scene; replacing the previous one");
+    builder(L).env().radar = r;
+    a.checkUnknown();
+    return 0;
+}
+
 int api_far_field(lua_State* L) {
     Args a(L, "far_field", {"min", "max", "center", "size", "margin", "wavelength", "frequency", "averaging", "name",
                             "log"});
@@ -1822,10 +1970,12 @@ void registerApi(lua_State* L) {
         {"frame", wrap<api_frame>},         {"shape", wrap<api_shape>},
         {"dipole", wrap<api_dipole>},       {"loop", wrap<api_loop>},
         {"monopole", wrap<api_monopole>},  {"wire", wrap<api_wire>},
+        {"sheet", wrap<api_sheet>},        {"sweep", wrap<api_sweep>},
         {"plane_wave", wrap<api_plane_wave>}, {"gaussian_beam", wrap<api_gaussian_beam>},
         {"array", wrap<api_array>},         {"current_source", wrap<api_current_source>},
         {"probe", wrap<api_probe>},         {"flux_plane", wrap<api_flux_plane>},
         {"flux_box", wrap<api_flux_box>},   {"far_field", wrap<api_far_field>},
+        {"radar", wrap<api_radar>},
     };
     for (const luaL_Reg& r : api) lua_register(L, r.name, r.func);
 
@@ -1884,7 +2034,17 @@ void emitThinWires(Context& c) {
             nodes[w].insert(key(p));
         }
     }
+    // Nodes on perfectly conducting edges that exist before the wires (metal sheets).
+    std::set<long long> sheetNodes;
+    for (const EdgeOverride& e : env.subcell.edges) {
+        if (e.sigma < 0.5f * kPerfectEdgeSigma) continue;
+        glm::ivec3 end = e.texel;
+        end[e.axis] += 1;
+        sheetNodes.insert(key(e.texel));
+        sheetNodes.insert(key(end));
+    }
     auto touchesConductor = [&](size_t self, const glm::ivec3& p) {
+        if (sheetNodes.count(key(p))) return true;
         for (size_t w = 0; w < nodes.size(); ++w)
             if (w != self && nodes[w].count(key(p))) return true;
         for (int dz = -1; dz <= 0; ++dz)
@@ -1899,8 +2059,18 @@ void emitThinWires(Context& c) {
         glm::ivec3 a = t.node, b = t.node;
         a[t.axis] = t.i0;
         b[t.axis] = t.i1;
-        if (!touchesConductor(w, a) && t.gapEdge != t.i0) ++t.i0;
-        if (!touchesConductor(w, b) && t.gapEdge != t.i1 - 1) --t.i1;
+        const bool freeA = !touchesConductor(w, a) && t.gapEdge != t.i0;
+        const bool freeB = !touchesConductor(w, b) && t.gapEdge != t.i1 - 1;
+        // The end correction must leave at least one conductor edge besides the feed gap.
+        const int keep = (t.gapEdge >= t.i0 && t.gapEdge < t.i1) ? 2 : 1;
+        if ((t.i1 - t.i0) - (freeA ? 1 : 0) - (freeB ? 1 : 0) >= keep) {
+            if (freeA) ++t.i0;
+            if (freeB) --t.i1;
+        } else if (freeA || freeB) {
+            c.warnings.push_back(fmt("thin wire at (%d, %d, %d) is too short for the end correction: its free end "
+                                     "acts about one cell longer than built (make it longer, or join its end to a "
+                                     "conductor)", a.x, a.y, a.z));
+        }
 
         const float f = 2.0f / std::log(1.0f / t.radius);
         const int u = (t.axis + 1) % 3, v = (t.axis + 2) % 3;
@@ -1970,6 +2140,14 @@ void finalChecks(Context& c) {
     for (const SourceDesc& s : env.sources)
         if (glm::length(s.halfExtent) < 1e3f && inAbsorber(s.center))
             c.warnings.push_back("a source lies inside the absorbing boundary layer (it will be damped)");
+    if (env.sweep) {
+        bool pulsed = false;
+        for (const SourceDesc& s : env.sources) pulsed = pulsed || s.waveform == Waveform::GaussianPulse;
+        if (env.ports.empty()) c.warnings.push_back("sweep: the scene has no antenna feeds (ports) to sweep");
+        else if (!pulsed)
+            c.warnings.push_back("sweep: the antennas are driven with a continuous wave, which only contains one "
+                                 "frequency; use waveform = \"pulse\" for a frequency sweep");
+    }
     if (env.farField) {
         if (c.sheetSources > 0)
             c.warnings.push_back("far_field: plane-wave / beam sources cross the Huygens box; the pattern is only "
@@ -2061,7 +2239,27 @@ bool ScriptParam::handleKey(char key) {
 // =============================================================================
 // ScriptEngine
 // =============================================================================
+namespace {
+ScriptResult runOnce(const fs::path& script, const std::map<std::string, std::string>& overrides, bool withTargets);
+} // namespace
+
 ScriptResult ScriptEngine::run(const fs::path& script, const std::map<std::string, std::string>& overrides) {
+    ScriptResult r = runOnce(script, overrides, true);
+    if (r.env.radar) {
+        // The radar's calibration scene: everything except the targets.
+        ScriptResult bg = runOnce(script, overrides, false);
+        r.backgroundMaterials = std::move(bg.env.materials);
+        r.backgroundSubcell = std::move(bg.env.subcell);
+        if (r.env.targets.empty())
+            r.warnings.push_back("radar: no object is marked target = true, so the calibration (which removes the "
+                                 "targets) sees the same scene and every echo cancels; mark what the radar should "
+                                 "detect with target = true");
+    }
+    return r;
+}
+
+namespace {
+ScriptResult runOnce(const fs::path& script, const std::map<std::string, std::string>& overrides, bool withTargets) {
     std::ifstream in(script, std::ios::binary);
     if (!in) {
         std::error_code ec;
@@ -2074,6 +2272,7 @@ ScriptResult ScriptEngine::run(const fs::path& script, const std::map<std::strin
     Context c;
     c.script = script;
     c.overrides = overrides;
+    c.withTargets = withTargets;
     c.start = std::chrono::steady_clock::now();
     for (const auto& kv : builtinMaterials()) c.materials[kv.first] = kv.second;
     g_ctx = &c;
@@ -2111,3 +2310,4 @@ ScriptResult ScriptEngine::run(const fs::path& script, const std::map<std::strin
                                                       : base / c.settings.outputDir);
     return r;
 }
+} // namespace

@@ -192,6 +192,7 @@ private:
     Shader m_updateE;
     Shader m_updateB;
     Shader m_clear;
+    Shader m_applySources;       // source currents, only over the cells sources reach
 
     gl::Texture m_eField;
     gl::Texture m_bField;
@@ -201,6 +202,9 @@ private:
     bool m_hasThinWires = false;
     gl::Buffer  m_sourceBuffer;  // static per-source geometry (std430 Source[])
     gl::Buffer  m_signalBuffer;  // per-step s(t) values (std430 float[])
+    gl::Buffer  m_sourceCells;   // ivec4(cell, first list entry) per affected cell, plus a sentinel
+    gl::Buffer  m_sourceLists;   // source indices per affected cell
+    int m_sourceCellCount = 0;
 
     GridConfig m_config{};
     glm::ivec3 m_allocatedSize{0};

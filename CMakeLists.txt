@@ -21,6 +21,8 @@ find_package(SDL3 CONFIG REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(Lua 5.4 REQUIRED)   # scene scripting (Lua 5.4 or newer)
+find_package(imgui CONFIG REQUIRED)   # on-screen instrument panels (vcpkg: imgui[sdl3-binding,opengl3-binding])
+find_package(implot CONFIG REQUIRED)  # plots (S11, radiation pattern)
 
 # GLAD: OpenGL 4.6 Core loader (generated with glad 0.1.36, vendored in external/glad)
 add_library(glad STATIC external/glad/src/glad.c)
@@ -43,6 +45,9 @@ set(EMLAB_SOURCES
   src/Instruments.cpp
   src/ScriptEngine.cpp
   src/Ports.cpp
+  src/Ui.cpp
+  src/Radar.cpp
+  src/InstrumentsUi.cpp
 )
 
 set(EMLAB_HEADERS
@@ -58,12 +63,15 @@ set(EMLAB_HEADERS
   src/Instruments.hpp
   src/ScriptEngine.hpp
   src/Ports.hpp
+  src/Ui.hpp
+  src/Radar.hpp
 )
 
 set(EMLAB_SHADERS
   shaders/common.glsl
   shaders/update_E.comp
   shaders/update_B.comp
+  shaders/apply_sources.comp
   shaders/clear_fields.comp
   shaders/poynting_flux.comp
   shaders/field_sampling.glsl
@@ -91,6 +99,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   SDL3::SDL3
   OpenGL::GL
   glm::glm
+  imgui::imgui
+  implot::implot
   ${LUA_LIBRARIES}
 )
 
@@ -109,7 +119,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 
 if(MSVC)
   set_target_properties(${PROJECT_NAME} glad PROPERTIES
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL") # match the vcpkg x64-windows libraries
   target_compile_options(${PROJECT_NAME} PRIVATE
     /W4 /permissive- /utf-8 /MP
     $<$<CONFIG:Release>:/O2 /fp:fast>

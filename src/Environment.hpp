@@ -11,6 +11,7 @@
 #include "FarField.hpp"
 #include "FieldAnalyzer.hpp"
 #include "Ports.hpp"
+#include "Radar.hpp"
 #include "SimulationGrid.hpp"
 
 #include <glm/glm.hpp>
@@ -149,6 +150,11 @@ struct WireSegment {
     float radius = 0.05f;       // cells
 };
 
+// A zero-thickness metal sheet, for drawing (the solver uses Environment::subcell).
+struct SheetRect {
+    glm::vec3 a{0.0f}, b{0.0f}; // opposite lattice-node corners (equal along the normal axis)
+};
+
 struct FluxSetup {
     FluxSurface surface;               // surface.label is the monitor name
     std::string logPath;
@@ -167,7 +173,11 @@ struct Environment {
     std::optional<FarFieldSetup> farField;
     SubcellModel subcell;            // thin-wire conductors and lumped feed resistors
     std::vector<WireSegment> wires;  // thin wires, for the overlay
+    std::vector<SheetRect> sheets;   // zero-thickness metal sheets, for the overlay
+    std::optional<SweepSetup> sweep; // frequency sweep of the antenna ports
     std::vector<PortSetup> ports;    // antenna feeds: impedance, VSWR, accepted power
+    std::optional<RadarSetup> radar; // pulsed radar receiver on the antenna ports
+    std::vector<TargetInfo> targets; // objects marked target = true (removed for radar calibration)
     ViewHints view;
 };
 

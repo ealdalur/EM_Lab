@@ -49,6 +49,10 @@ struct ScriptResult {
     std::vector<ScriptParam> params;
     std::vector<std::string> warnings;
     std::filesystem::path outputDir;  // where relative log paths are written
+    // Radar scenes: the same scene without the objects marked target = true (the radar's
+    // calibration run). Only set when the script defines radar{}.
+    std::optional<MaterialVolume> backgroundMaterials;
+    SubcellModel backgroundSubcell;
 };
 
 class ScriptError : public std::runtime_error {

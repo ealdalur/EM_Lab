@@ -136,8 +136,11 @@ SimulationGrid::SimulationGrid(const fs::path& shaderDir)
     : m_updateE(Shader::computeFromFile(shaderDir / "update_E.comp")),
       m_updateB(Shader::computeFromFile(shaderDir / "update_B.comp")),
       m_clear(Shader::computeFromFile(shaderDir / "clear_fields.comp")),
+      m_applySources(Shader::computeFromFile(shaderDir / "apply_sources.comp")),
       m_sourceBuffer(gl::createBuffer()),
-      m_signalBuffer(gl::createBuffer()) {
+      m_signalBuffer(gl::createBuffer()),
+      m_sourceCells(gl::createBuffer()),
+      m_sourceLists(gl::createBuffer()) {
     glNamedBufferData(m_sourceBuffer.get(), sizeof(GPUSource) * kMaxSources, nullptr, GL_DYNAMIC_DRAW);
     glNamedBufferData(m_signalBuffer.get(), sizeof(float) * kMaxSources * 16, nullptr, GL_STREAM_DRAW);
     m_signalScratch.reserve(kMaxSources * 16);
@@ -190,6 +193,7 @@ void SimulationGrid::configure(const GridConfig& requested) {
 
     applySolverUniforms(m_updateE);
     applySolverUniforms(m_updateB);
+    applySolverUniforms(m_applySources);
     m_clear.set("uGridSize", m_config.size);
     m_stepCount = 0;
 }
@@ -312,7 +316,44 @@ void SimulationGrid::setSources(const std::vector<SourceDesc>& sources) {
     if (!packed.empty())
         glNamedBufferSubData(m_sourceBuffer.get(), 0, static_cast<GLsizeiptr>(packed.size() * sizeof(GPUSource)),
                              packed.data());
-    m_updateE.set("uSourceCount", static_cast<int>(packed.size()));
+
+    // Cells each source can reach: its flat-top box plus 3.5 Gaussian widths (the footprint is
+    // below 5e-6 beyond), and one cell for the staggered samples. Sorted (cell, source) pairs
+    // become a compact list: one GPU thread per affected cell, looping over its own sources.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pairs;
+    const glm::ivec3 n = m_config.size;
+    for (size_t i = 0; i < packed.size(); ++i) {
+        const glm::vec3 c(packed[i].center), h(packed[i].halfExtent), w(packed[i].softness);
+        const glm::ivec3 lo = glm::clamp(glm::ivec3(glm::floor(c - h - 3.5f * w)) - 1, glm::ivec3(0), n - 1);
+        const glm::ivec3 hi = glm::clamp(glm::ivec3(glm::ceil(c + h + 3.5f * w)), glm::ivec3(0), n - 1);
+        for (int z = lo.z; z <= hi.z; ++z)
+            for (int y = lo.y; y <= hi.y; ++y)
+                for (int x = lo.x; x <= hi.x; ++x)
+                    pairs.emplace_back(static_cast<std::uint32_t>((z * n.y + y) * n.x + x), static_cast<std::uint32_t>(i));
+    }
+    std::sort(pairs.begin(), pairs.end());
+    std::vector<glm::ivec4> cells;
+    std::vector<std::int32_t> lists;
+    lists.reserve(pairs.size());
+    for (size_t k = 0; k < pairs.size(); ++k) {
+        if (k == 0 || pairs[k].first != pairs[k - 1].first) {
+            const std::uint32_t idx = pairs[k].first;
+            const int x = static_cast<int>(idx % static_cast<std::uint32_t>(n.x));
+            const int y = static_cast<int>((idx / static_cast<std::uint32_t>(n.x)) % static_cast<std::uint32_t>(n.y));
+            const int z = static_cast<int>(idx / static_cast<std::uint32_t>(n.x * n.y));
+            cells.emplace_back(x, y, z, static_cast<int>(lists.size()));
+        }
+        lists.push_back(static_cast<std::int32_t>(pairs[k].second));
+    }
+    m_sourceCellCount = static_cast<int>(cells.size());
+    cells.emplace_back(0, 0, 0, static_cast<int>(lists.size())); // sentinel: end of the last list
+    if (lists.empty()) lists.push_back(0);
+    // Immutable storage, recreated when the sources change (written once, read by the GPU only).
+    m_sourceCells = gl::createBuffer();
+    m_sourceLists = gl::createBuffer();
+    glNamedBufferStorage(m_sourceCells.get(), static_cast<GLsizeiptr>(cells.size() * sizeof(glm::ivec4)), cells.data(), 0);
+    glNamedBufferStorage(m_sourceLists.get(), static_cast<GLsizeiptr>(lists.size() * sizeof(std::int32_t)), lists.data(), 0);
+    m_applySources.set("uCellCount", m_sourceCellCount);
 }
 
 void SimulationGrid::resetFields() {
@@ -360,12 +401,23 @@ void SimulationGrid::step(int count, const std::function<void()>& afterEachStep)
 
         // --- Ampere: E^{n+1} = Ca E^n + Cb (curl B^{n+1/2} - J^{n+1/2}) -------
         m_updateE.use();
-        m_updateE.set("uSignalBase", k * static_cast<int>(nSrc));
         bindImage(0, m_eField.get());
         glBindTextureUnit(1, m_bField.get());
         glBindTextureUnit(2, m_edgeMaterial.get());
         m_updateE.dispatchCovering(cells);
         glMemoryBarrier(kFieldBarrier);
+
+        // --- source currents: E^{n+1} -= Cb J^{n+1/2}, only where sources reach -----
+        if (m_sourceCellCount > 0) {
+            m_applySources.use();
+            m_applySources.set("uSignalBase", k * static_cast<int>(nSrc));
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_sourceBuffer.get());
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_signalBuffer.get());
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_sourceCells.get());
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_sourceLists.get());
+            glDispatchCompute(gl::divUp(static_cast<GLuint>(m_sourceCellCount), 64u), 1, 1);
+            glMemoryBarrier(kFieldBarrier);
+        }
 
         ++m_stepCount; // observers see the time of the step that just completed
         if (afterEachStep) {

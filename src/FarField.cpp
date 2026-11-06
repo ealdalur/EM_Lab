@@ -13,8 +13,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr int kCutSamples = 180;    // 2 degree resolution per principal-plane cut
-constexpr int kSphereTheta = 18;    // 10 degree sphere sampling for the global maximum
-constexpr int kSpherePhi = 36;
+constexpr int kMapSize = 81;        // u-v beam-map grid per hemisphere (also the global-maximum search)
 constexpr GLuint kLocal = 256;
 
 struct GPUPhasorPair {
@@ -80,16 +79,21 @@ FarFieldMonitor::FarFieldMonitor(const fs::path& shaderDir)
         }
         m_pattern.cuts.push_back(std::move(cut));
     }
+    // Beam maps: a regular grid in direction cosines (u, v) for each hemisphere. Cells outside
+    // the unit circle are not directions and are skipped (index -1).
     m_sphereBegin = static_cast<int>(m_dirs.size());
-    for (int it = 0; it < kSphereTheta; ++it) {
-        const float th = glm::radians(5.0f + 10.0f * static_cast<float>(it));
-        for (int ip = 0; ip < kSpherePhi; ++ip) {
-            const float ph = glm::radians(10.0f * static_cast<float>(ip));
-            m_dirs.emplace_back(std::sin(th) * std::cos(ph), std::sin(th) * std::sin(ph), std::cos(th), 0.0f);
-        }
-    }
-    m_dirs.emplace_back(0.0f, 0.0f, 1.0f, 0.0f);
-    m_dirs.emplace_back(0.0f, 0.0f, -1.0f, 0.0f);
+    m_mapIndex.assign(2 * kMapSize * kMapSize, -1);
+    for (int h = 0; h < 2; ++h)
+        for (int r = 0; r < kMapSize; ++r)
+            for (int c = 0; c < kMapSize; ++c) {
+                const float u = -1.0f + 2.0f * static_cast<float>(c) / (kMapSize - 1);
+                const float v = 1.0f - 2.0f * static_cast<float>(r) / (kMapSize - 1);
+                const float rho2 = u * u + v * v;
+                if (rho2 > 1.0f) continue;
+                const float w = std::sqrt(std::max(1.0f - rho2, 0.0f));
+                m_mapIndex[static_cast<size_t>((h * kMapSize + r) * kMapSize + c)] = static_cast<int>(m_dirs.size());
+                m_dirs.emplace_back(u, v, h == 0 ? w : -w, 0.0f);
+            }
 
     // Immutable: written once here, then only read by the pattern shader.
     glNamedBufferStorage(m_directions.get(), static_cast<GLsizeiptr>(m_dirs.size() * sizeof(glm::vec4)), m_dirs.data(), 0);
@@ -210,6 +214,16 @@ const FarFieldPattern& FarFieldMonitor::evaluate(const SimulationGrid& /*grid*/)
         }
     }
     m_pattern.maxDirectivityDbi = toDbi(best);
+
+    m_pattern.mapSize = kMapSize;
+    m_pattern.mapUpperDbi.assign(static_cast<size_t>(kMapSize * kMapSize), -120.0f);
+    m_pattern.mapLowerDbi.assign(static_cast<size_t>(kMapSize * kMapSize), -120.0f);
+    for (size_t i = 0; i < m_mapIndex.size(); ++i) {
+        if (m_mapIndex[i] < 0) continue;
+        const size_t cellIndex = i % static_cast<size_t>(kMapSize * kMapSize);
+        auto& map = i < static_cast<size_t>(kMapSize * kMapSize) ? m_pattern.mapUpperDbi : m_pattern.mapLowerDbi;
+        map[cellIndex] = toDbi(directivity(static_cast<size_t>(m_mapIndex[i])));
+    }
 
     size_t idx = 0;
     for (PatternCut& cut : m_pattern.cuts) {

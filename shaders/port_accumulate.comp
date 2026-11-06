@@ -28,11 +28,14 @@ struct PortPhasor {
 
 layout(std430, binding = 6) readonly restrict buffer PortBuffer { Port uPorts[]; };
 layout(std430, binding = 7) restrict buffer PortPhasorBuffer { PortPhasor uPhasors[]; };
+// Frequency sweeps: (V, I) of every port at every step, index = step * uPortCount + port.
+layout(std430, binding = 8) writeonly restrict buffer SeriesBuffer { vec2 uSeries[]; };
 
 uniform ivec3 uGridSize;
 uniform int   uPortCount;
 uniform vec4  uRotation; // (cos w t_E, sin w t_E, cos w t_H, sin w t_H)
 uniform float uBlend;    // per-stage EMA weight
+uniform int   uRecordIndex; // step index into uSeries, or -1 when not recording
 
 vec4 fetchE(ivec3 p) { return texelFetch(uEField, clamp(p, ivec3(0), uGridSize - 1), 0); }
 vec4 fetchB(ivec3 p) { return texelFetch(uBField, clamp(p, ivec3(0), uGridSize - 1), 0); }
@@ -69,6 +72,7 @@ void main() {
     }
     V *= s;
     I *= s;
+    if (uRecordIndex >= 0) uSeries[uRecordIndex * uPortCount + i] = vec2(V, I);
 
     vec4 obs = vec4(2.0 * uRotation.x * V, -2.0 * uRotation.y * V,
                        2.0 * uRotation.z * I, -2.0 * uRotation.w * I);

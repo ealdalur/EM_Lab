@@ -37,7 +37,9 @@ Contents:
 
 **Reloading.** If a reload changes only sources, instruments or view settings, the running fields are kept. That's how live beam steering works. If the grid size or any material changes, the fields are reset.
 
-**Errors.** A failed script reports the file, line and reason in the console, for example `my_scene.lua:12: sphere: 'radius' must be > 0`. The previous scene keeps running. Unknown or misspelled keys trigger warnings with suggestions, such as `unknown field 'radious' ignored (did you mean 'radius'?)`.
+**Parameters on screen.** Every `param{}` also appears in the **Scene** panel as a slider, menu or checkbox with its key next to it. A slider re-runs the script when you release it.
+
+**Errors.** A failed script reports the file, line and reason in the console and in red in the Scene panel, for example `my_scene.lua:12: sphere: 'radius' must be > 0`. The previous scene keeps running. Unknown or misspelled keys trigger warnings with suggestions, such as `unknown field 'radious' ignored (did you mean 'radius'?)`.
 
 **Sandbox.** Scripts run without the `io` and `os` libraries and cannot load C modules. A script that runs longer than 30 s is stopped. `require "name"` loads `name.lua` from the script's folder or its `lib/` subfolder, so you can keep shared component libraries there. `print()` writes to the console.
 
@@ -144,7 +146,7 @@ local taper  = param { name = "taper", choices = {"uniform", "hann"}, key = "t" 
 | `min`, `max`, `step`, `wrap` | numeric range. `wrap = true` wraps around at the ends. |
 | `keys = {dec, inc}` / `key` | key binding for numbers / for booleans and choices |
 
-Parameters may use these keys: `B F G I J T U X Y Z , . ; ' / \ `` ` ``. All other keys belong to the application. Current values appear in the title bar.
+Parameters may use these keys: `B F G I J T U X Y Z , . ; ' / \ `` ` ``. All other keys belong to the application. Current values appear in the Scene panel (where they can also be changed) and in the title bar.
 
 ---
 
@@ -157,6 +159,7 @@ Common keys:
 - `rotate = {rx, ry, rz}`: Euler angles in degrees, applied about x, then y, then z, around the shape's centre. Supported by `box`, `sphere` and `cylinder`.
 - `thickness`: makes the shape hollow, leaving a shell of that thickness. Supported by `box`, `sphere` and `cylinder`.
 - `name`: optional label used in messages.
+- `target = true`: marks the object as something a `radar{}` should detect (`box`, `sphere`, `cylinder` and `shape`). See §8.
 
 | Primitive | Keys | Notes |
 |---|---|---|
@@ -168,6 +171,9 @@ Common keys:
 | `cage{}` | `min`/`max` or `center`/`size`, `spacing=4`, `bar=2` | Hollow box whose six faces are a square mesh of bars (Faraday cage). |
 | `frame{}` | `min`/`max` or `center`/`size`, `bar=2` | The 12 edges of a box. |
 | `shape{}` | `min`/`max` or `center`/`size` (bounds), `inside = function(x,y,z) ... end` | **Arbitrary geometry.** `inside` receives the cell-centre coordinates and returns `true` for cells to fill. |
+| `sheet{}` | `min`+`max` **or** `center`+`size`, equal along one axis (the normal) | **Zero-thickness perfect conductor** in a lattice plane: copper foil, a patch, a microstrip, a ground layer on a board. See below. |
+
+**Sheets.** `sheet{}` doesn't fill cells. It makes every E-field edge lying in the rectangle a perfect conductor, so a foil can sit exactly on the surface of a dielectric `box{}` (a patch on its substrate) without taking up a cell of the board. Corners are lattice nodes, so give integer coordinates; the two in-plane extents must be non-zero (`sheet{ min = vec(10, 10, 40), max = vec(50, 30, 40) }` is normal to z). Sheets are applied after the voxels, so a later `box{ material = "vacuum" }` does not cut a hole in them. A thin-wire end that lands on a sheet is joined to it, which is how a coax probe connects a ground plane to a patch. The overlay draws sheets as hatched copper rectangles.
 
 Wall apertures use the wall's **tangential coordinates `{u, v}`**: the two remaining axes in x, y, z order. For example, for `axis = "x"`, `u = y` and `v = z`.
 
@@ -308,19 +314,55 @@ Radiation resistance agrees within a few percent. Reactance agrees closely for s
 
 Things to know:
 - **End correction.** The lattice node at the free end of a thin wire holds more charge than a real wire's tip, which made wires act about one cell longer per free end. Each free end is therefore built one cell short, automatically, so the *electrical* length matches the length you ask for. Ends that touch another conductor (another wire, a metal plate, a radial hub, the corners of a loop) aren't free and aren't shortened. The overlay draws wires at their requested length.
-- **Lengths in whole cells.** A dipole is two arms plus the one-cell gap, so its length is odd (`length = 8` becomes 7 or 9, with a warning). A monopole is the gap plus the conductor. Wires follow grid lines; feed positions snap to the nearest lattice line.
+- **Lengths in whole cells.** A dipole is two arms plus the one-cell gap, so its length is odd (`length = 8` becomes 7 or 9, with a warning). A monopole is the gap plus the conductor; a thin one needs 3 cells, or only 2 when its top joins a conductor (a probe feeding a patch through its board), because a joined end gets no end correction. Wires follow grid lines; feed positions snap to the nearest lattice line.
 - **Thin wires are invisible in the volume render** (they're thinner than a cell). The overlay draws them as bright lines.
 - **Straight wires only.** Thin wires run along x, y or z. Slanted conductors (such as drooping radials) can be staircased from metal cells with `shape{}`, which is approximate.
 - **Far field with grounds.** A ground plate must fit *inside* the far-field box, so a truly infinite plane (one reaching into the absorbing layer) can't be combined with `far_field{}`. Finite plates show the real-world behavior anyway.
-- **Not modelled:** feed lines, baluns and matching networks (the port shows the bare antenna impedance), wire losses (wires are perfect conductors), and frequency sweeps (impedance is computed at one frequency per run; change `wavelength`/`frequency` or the length to sweep).
+- **Not modelled:** feed lines, baluns and matching networks (the port shows the bare antenna impedance), and wire losses (wires are perfect conductors).
 
-`12_monopole_ground.lua` compares ground planes and counterpoises; `validation/dipole_impedance.lua` reproduces the table above.
+`12_monopole_ground.lua` compares ground planes and counterpoises; `13_antenna_matching.lua` shows what a mismatch costs; `validation/dipole_impedance.lua` reproduces the table above.
+
+### Frequency sweeps: `sweep{}`
+
+A continuous wave measures the ports at one frequency. To get Z, S11 and VSWR across a band in **one run**, drive the antennas with a short pulse and add `sweep{}`:
+
+```lua
+monopole { base = vec(40, 64, 50), length = 3, radius = mm(0.65), frequency = 2.4e9,
+           waveform = "pulse", pulse_width = 0.4 }                  -- a short pulse is a broadband signal
+sweep    { frequencies = {1.9e9, 2.9e9}, points = 201, log = "s11.csv" }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `frequencies = {lo, hi}` (Hz) **or** `wavelengths = {lo, hi}` (cells) | required | The band to analyse. |
+| `points` | 81 | Frequencies, evenly spaced (2–2001). |
+| `log` | none | CSV: `frequency_Hz, wavelength_cells`, then `R_ohm, X_ohm, S11_dB, VSWR` per port. |
+
+How it works: every time step the GPU records each port's gap voltage and current. Their Fourier transforms (double precision, on the CPU) give Z(f) = V(f)/I(f), exactly as a network analyser does with a time-domain pulse. Because the pulse spectrum cancels in the ratio, its exact shape doesn't matter, as long as it carries energy across the band. A Gaussian pulse of `pulse_width` τ periods has a spectrum that falls to 1/e at f₀ ± f₀/(π τ); for example, 0.4 gives about ±80%.
+
+What you see:
+- **Plot.** The **Frequency sweep** window has three tabs: S11 (dB), VSWR and impedance (R and X) against frequency in GHz. It marks the −10 dB line, the source (design) frequency, the −10 dB band edges and the best match (frequency, S11, VSWR, Z). It shows up to four ports.
+- **Readouts.** The **Instruments** window lists, for each port, the best match (frequency, S11, VSWR, Z) and the −10 dB bandwidth (VSWR < 1.92). The single-frequency port readings are hidden; with a pulse they would be meaningless. **P** prints the same to the console.
+- **Title bar.** It shows the best match.
+
+```
+sweep: 9600 steps recorded, ring-down 2.2e-08 of peak (settled)
+sweep probe   best match 2.4437 GHz (lambda 58.93 cells): S11 -20.4 dB, VSWR 1.21, Z = 52.8 +9.5j ohm | -10 dB band 2.3697-2.5222 GHz (6.2%)
+```
+
+Rules:
+- **Let it ring down.** The transform is only right once the antenna has stopped ringing. The report gives the ring-down (late voltage relative to the peak) and says "settled" below 10⁻³. High-Q antennas (narrow-band patches, small loops) ring for tens of periods.
+- **Restarts.** A sweep always restarts the fields when the script reloads, because the record must start at t = 0.
+- **Record length.** The record holds up to 2²³ samples shared by all ports (about 4 million steps for one port). If it fills, the report says so.
+- **Accuracy.** The sweep and a CW run agree to 0.1% at the same frequency (patch: 74.13 + j8.59 Ω swept, 74.1 + j8.6 Ω CW). The usual resolution guidelines (§9) apply at the *highest* swept frequency; the script warns when the band goes below 6 cells per wavelength.
+
+`14_patch_antenna.lua` sweeps a probe-fed microstrip patch.
 
 ---
 
 ## 8. Instruments
 
-Results appear in the console every 2 s, and immediately when you press **P**. A scene without instruments keeps the console quiet; it prints a one-line hint when it loads. The first probe, the first flux monitor, the first antenna port (Z, VSWR) and D_max are also shown in the title bar. Antenna feeds are ports automatically (see §7); **P** lists every port. **Tab** cycles through probes; the arrow keys and PgUp/PgDn move the selected probe. Add `log = "file.csv"` to any instrument to record data. Relative paths go in the scene's output folder.
+Results appear on screen in the **Instruments** window, as tables that update in place at the refresh interval (0.5 s by default; change it under View in the Scene panel). Hover over a column header for an explanation. Plots get their own windows (frequency sweep, radiation pattern, array elements, radar). **P** prints the full report to the console, and unattended `--frames` runs print it periodically. A scene without instruments shows no Instruments window. The first probe, the first flux monitor, the first antenna port (Z and VSWR, or the best match during a frequency sweep) and D_max are also shown in the title bar. Antenna feeds are ports automatically (see §7); **P** lists every port. **Tab** cycles through probes; the arrow keys and PgUp/PgDn move the selected probe. Add `log = "file.csv"` to any instrument to record data. Relative paths go in the scene's output folder.
 
 | Primitive | Keys | Measures | CSV columns |
 |---|---|---|---|
@@ -334,11 +376,58 @@ Cut angles:
 - **xz**: from +x toward +z.
 - **yz**: from +y toward +z.
 
-D_max is searched over the three cuts plus a 10° grid covering the whole sphere.
+D_max is searched over the three cuts plus two **beam maps**: 81 × 81 grids in direction cosines u = sin θ cos φ, v = sin θ sin φ for each hemisphere (about 2° near broadside). The **Radiation pattern** window shows them as heatmaps with rings at θ = 30°, 60° and 90°, so a beam steered in any direction is visible, not only one in a principal plane. The Cuts tab plots the three principal planes in dBi.
+
+**Arrays.** When the ports form a regular rectangular lattice (a phased array), the **Array elements** window shows each element's active VSWR, S11, accepted power, R or X as a map laid out like the array. In an array, an element's impedance depends on how its neighbours are driven (mutual coupling), so it changes with steering: this is the active, or scan, impedance. `15_patch_array.lua` shows it.
 
 **Far-field rules.** The far-field box must enclose all sources and objects, lie in vacuum, and stay out of the absorbing layer. The app warns otherwise. Plane-wave sources cross the box, so the pattern is only meaningful for localized antennas. The pattern is computed at one frequency (CW). After a change, allow about 3 × `averaging` periods for it to settle; the report says "still settling" until then.
 
 **Validated accuracy.** For a Hertzian dipole (`scenes/validation/hertzian_dipole.lua`; theory 1.76 dBi, HPBW 90°), the far-field monitor gives 1.87 dBi and 87.5° at 16 cells/λ, and 1.78 dBi and 89.4° at 32 cells/λ. The error is second order: it falls about 4× each time the resolution doubles. The closed flux box matches the analytic radiated power to within 0.3%.
+
+### Radar: `radar{}`
+
+`radar{}` turns the scene's antenna feeds into a pulsed radar. The feeds transmit (drive them with `waveform = "pulse"`; feeds with `amplitude = 0` only receive), and every feed records its received voltage at every time step. Mark what the radar should detect with `target = true`:
+
+```lua
+monopole { ..., waveform = "pulse", pulse_width = 0.5 }                       -- each array element
+sphere   { center = vec(112, 112, 148), radius = 30, material = "metal", target = true, name = "sphere" }
+radar    { range = {40, 200}, fov = 35, noise = -45, log = "detections.csv" }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `range = {min, max}` | 1 λ to the absorber | Image range in cells from the transmit centre. |
+| `fov` | 40 | Image half-angle in degrees, or `{azimuth, elevation}`. Azimuth is measured from boresight toward the next axis (x for a z-facing array), elevation toward the third (y). |
+| `noise` | none | Receiver noise: rms within the radar's band, in dB relative to the transmit pulse peak at a port (e.g. `-45`). |
+| `threshold` | 13 | Detection threshold in dB above the image floor (the median level). |
+| `dynamic_range` | 25 | Detections must lie within this many dB of the strongest return. |
+| `taper` | `"hamming"` | Receive amplitude taper: `"uniform"` (narrowest beam, −13 dB sidelobes that show up as false targets), `"hamming"` or `"hann"`. |
+| `phase_center` | `{0,0,0}` | Element phase centre relative to its feed gap (cells), e.g. the centre of a patch. |
+| `tx` | drive-weighted feed centroid | Transmit phase centre, for range and angle. |
+| `reference` | 1.5 λ | Distance of the timing reference point on boresight. |
+| `log` | none | CSV of the detections after each measurement. |
+
+How it works:
+1. **Calibration (clutter cancellation).** The script is run a second time without the `target = true` objects, and the radar first transmits into that scene. This records everything that isn't a target: the pulse ringing in the feeds, coupling between elements, reflections from fixed structures. Then the targets are swapped in, the fields are reset, and the pulse is sent again. The difference of the two recordings is the echo.
+2. **Pulse compression.** During calibration, a reference point on boresight records the transmitted field. With the transmit array's near-field factor divided out, squared and divided by the drive spectrum, it gives the radar's complete two-way response T = S·H². Correlating each echo with T peaks at exactly the round-trip path delay, whatever the antennas' group delay.
+3. **Back-projection (digital beamforming).** For each point of a range × azimuth × elevation grid, the compressed echoes of all elements are taken at that point's exact round-trip delay and added coherently, with the receive taper. Because the geometry is exact, the image is focused in the array's near field too.
+4. **Detection.** Local maxima above the floor plus `threshold` and within `dynamic_range` of the strongest, refined between grid points. Each is matched with the nearest target and compared with the target's point nearest the radar. For a convex object, that's where the mirror-like (specular) "glint" return comes from.
+
+**Reuse.** The calibration is kept while only the targets change, so moving a target costs one pulse. Changing only processing settings (`noise`, `threshold`, `fov`, `taper`, `dynamic_range`) re-processes the stored echoes instantly, without re-simulating. **R** transmits again.
+
+The **Radar** window shows the range-azimuth image (B-scope: strongest return over elevation), the azimuth-elevation image at the strongest return's range, the range profile with the floor and threshold, the raw signal at the centre element (calibration, measurement and their difference), and the detection table. In 3D, targets are orange boxes and detections red crosses.
+
+**Measured accuracy** (`16_array_radar.lua`, 8 × 8 patches at 10 GHz, λ = 30 mm, targets 2–4 λ away):
+
+| Target | Range error | Angle error |
+|---|---|---|
+| Sphere, plate, cylinder (2 × 2 transmitter) | −0.3, +1.3, 0.0 mm | < 1° |
+| Sphere at 4 λ, az 15°, el −10° | +2.4 mm | 2.5° az, 0.5° el (relative to the nearest point) |
+| Full 8 × 8 transmitter | +0.6 to +3.8 mm | < 0.5° |
+
+Two spheres are resolved 30° apart and merge at 20°: the Hamming-tapered beam is about 19° wide. **Range resolution** is a different matter. Two targets at the same angle are only separated if they are c / 2B apart, where B is the bandwidth: about 7 λ for this patch array's 7% band, which is larger than the whole scene. Real radars use much wider-band waveforms for this.
+
+**Limits.** The calibration assumes the fixed scene doesn't change between the two runs. Targets must be voxel objects (`box`, `sphere`, `cylinder`, `shape`). The transmit model (for range and the template) treats the elements as cos θ radiators. Multiple reflections between a target and the array appear as later "ghost" returns, as they do in a real radar.
 
 ---
 
@@ -359,7 +448,9 @@ D_max is searched over the three cuts plus a 10° grid covering the whole sphere
 - Non-magnetic materials only (μ_r = 1), and no frequency dispersion.
 - Materials are isotropic and constant within each cell.
 - Thin wires must run along x, y or z, at least a couple of cells from other conductors (except where they join). Wires are perfect conductors (no ohmic loss).
-- Antenna feeds are lumped sources in a one-cell gap. Feed lines, baluns and matching networks aren't modelled, and impedance is evaluated at one frequency per run.
+- Antenna feeds are lumped sources in a one-cell gap. Feed lines, baluns and matching networks aren't modelled. Impedance is evaluated at one frequency per run with CW, or across a band with a pulsed `sweep{}`.
+- Metal sheets (`sheet{}`) are perfect conductors lying in lattice planes.
+- The radar processes one transmitted pulse per measurement (no Doppler, no moving targets). Its range resolution is set by the antennas' bandwidth.
 - One far-field monitor per scene, at a single frequency.
 - There is no total-field/scattered-field formulation, so radar cross-section isn't computed. Measure scattering with probes and flux monitors instead.
 - Physical units are optional. Without them, all results are in normalised units (ε₀ = μ₀ = c = 1, one cell = 1).

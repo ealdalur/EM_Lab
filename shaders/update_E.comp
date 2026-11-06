@@ -11,10 +11,8 @@
 // The exponential integrator keeps the update exact for the loss term, so
 // sigma = 100 (metal) is perfectly stable: E decays by exp(-50) per step.
 //
-// Source injection: analytical current densities J(x,t) = p * A * w(x) * s(t),
-// where s(t) (e.g. J0 sin(wt + phi) with a smooth ramp) is evaluated per source
-// on the CPU in double precision once per step and w(x) is a soft box/Gaussian
-// spatial footprint evaluated here at every staggered E sample position.
+// Source currents J are added by apply_sources.comp, which runs right after this
+// pass over only the cells that sources reach.
 // =============================================================================
 #include "common.glsl"
 
@@ -25,47 +23,9 @@ layout(binding = 1) uniform sampler3D uBField;                  // rgb = B, a = 
 // Packed half floats: x = (sigma_x, sigma_y), y = (sigma_z, eps_x), z = (eps_y, eps_z)
 layout(binding = 2) uniform usampler3D uEdgeMaterial;
 
-struct Source {
-    vec4 center;      // xyz = centre (cell units)
-    vec4 halfExtent;  // xyz = flat-top half extents (cells)
-    vec4 polAmp;      // xyz = unit polarisation, w = amplitude J0
-    vec4 softness;    // xyz = per-axis Gaussian edge widths (cells, >= 0.25)
-};
-
-layout(std430, binding = 0) readonly restrict buffer SourceBuffer { Source uSources[]; };
-layout(std430, binding = 1) readonly restrict buffer SignalBuffer { float uSignals[]; };
-uniform int uSourceCount;
-uniform int uSignalBase;   // offset of this sub-step's signals in uSignals
-
 // Backward-difference neighbours; B below the lower faces is 0.
 vec3 fetchB(ivec3 p) {
     return all(greaterThanEqual(p, ivec3(0))) ? texelFetch(uBField, p, 0).xyz : vec3(0.0);
-}
-
-// Flat-top box with per-axis Gaussian edges: a point (all extents 0), a line
-// (one extent), a sheet (two huge extents) or a Gaussian beam profile.
-float footprint(Source s, vec3 x) {
-    vec3 d = max(abs(x - s.center.xyz) - s.halfExtent.xyz, vec3(0.0)) / s.softness.xyz;
-    return exp(-dot(d, d));
-}
-
-vec3 sourceCurrent(ivec3 cell) {
-    vec3 c = vec3(cell);
-    vec3 J = vec3(0.0);
-    for (int i = 0; i < uSourceCount; ++i) {
-        float signal = uSignals[uSignalBase + i];
-        if (signal == 0.0) continue;
-        Source s = uSources[i];
-        // Conservative cull against the cell's sample span [c, c + 0.5] at 3.5 sigma.
-        vec3 d = abs(c + 0.25 - s.center.xyz) - s.halfExtent.xyz - 0.25;
-        if (any(greaterThan(d, 3.5 * s.softness.xyz))) continue;
-
-        vec3 w = vec3(footprint(s, c + vec3(0.5, 0.0, 0.0)),   // Jx sample
-                      footprint(s, c + vec3(0.0, 0.5, 0.0)),   // Jy sample
-                      footprint(s, c + vec3(0.0, 0.0, 0.5)));  // Jz sample
-        J += s.polAmp.xyz * (s.polAmp.w * signal) * w;
-    }
-    return J;
 }
 
 void main() {
@@ -100,8 +60,7 @@ void main() {
     vec3 ca = exp(-x);           // decay factor, in (0, 1]
     vec3 cb = dtEps * phi(x);    // = (1 - ca) / sigma, -> dt/eps for sigma -> 0
 
-    vec3 J = (uSourceCount > 0) ? sourceCurrent(p) : vec3(0.0);
-
-    vec3 eNew = ca * e.xyz + cb * (curlB - J);
+    // Source currents are applied afterwards by apply_sources.comp (E -= cb J).
+    vec3 eNew = ca * e.xyz + cb * curlB;
     imageStore(uEField, p, vec4(eNew, e.w));      // preserve sigma in alpha
 }

@@ -1,0 +1,79 @@
+#version 460 core
+// =============================================================================
+// apply_sources.comp - impressed source currents, applied after update_E.comp.
+//
+// The Ampere update is E_new = Ca E + Cb (curl B - J), so the source term is the
+// separate correction E_new -= Cb J. Running it only over the cells a source can
+// reach (a list built on the CPU when the sources change, each cell with its own
+// short source list) keeps the cost independent of the grid size: a 64-element
+// array no longer evaluates 64 footprints in every one of millions of cells.
+//
+// J(x, t) = p * A * w(x) * s(t): s(t) per source and sub-step comes from the CPU
+// (double precision); w(x) is the soft box footprint at each staggered E sample.
+// =============================================================================
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0, rgba32f) uniform restrict image3D uEField; // rgb = E, a = sigma
+// Packed half floats: x = (sigma_x, sigma_y), y = (sigma_z, eps_x), z = (eps_y, eps_z)
+layout(binding = 2) uniform usampler3D uEdgeMaterial;
+
+struct Source {
+    vec4 center;      // xyz = centre (cell units)
+    vec4 halfExtent;  // xyz = flat-top half extents (cells)
+    vec4 polAmp;      // xyz = unit polarisation, w = amplitude J0
+    vec4 softness;    // xyz = per-axis Gaussian edge widths (cells, >= 0.25)
+};
+
+layout(std430, binding = 0) readonly restrict buffer SourceBuffer { Source uSources[]; };
+layout(std430, binding = 1) readonly restrict buffer SignalBuffer { float uSignals[]; };
+// xyz = cell, w = first entry in uSourceList; entry uCellCount is a sentinel holding the end.
+layout(std430, binding = 2) readonly restrict buffer CellBuffer { ivec4 uCells[]; };
+layout(std430, binding = 3) readonly restrict buffer ListBuffer { int uSourceList[]; };
+uniform int uCellCount;
+uniform int uSignalBase;   // offset of this sub-step's signals in uSignals
+
+float footprint(Source s, vec3 x) {
+    vec3 d = max(abs(x - s.center.xyz) - s.halfExtent.xyz, vec3(0.0)) / s.softness.xyz;
+    return exp(-dot(d, d));
+}
+
+void main() {
+    int id = int(gl_GlobalInvocationID.x);
+    if (id >= uCellCount) return;
+    ivec4 entry = uCells[id];
+    int end = uCells[id + 1].w;
+    ivec3 p = entry.xyz;
+    vec3 c = vec3(p);
+
+    vec3 J = vec3(0.0);
+    for (int k = entry.w; k < end; ++k) {
+        int i = uSourceList[k];
+        float signal = uSignals[uSignalBase + i];
+        if (signal == 0.0) continue;
+        Source s = uSources[i];
+        vec3 w = vec3(footprint(s, c + vec3(0.5, 0.0, 0.0)),   // Jx sample
+                      footprint(s, c + vec3(0.0, 0.5, 0.0)),   // Jy sample
+                      footprint(s, c + vec3(0.0, 0.0, 0.5)));  // Jz sample
+        J += s.polAmp.xyz * (s.polAmp.w * signal) * w;
+    }
+    if (all(equal(J, vec3(0.0)))) return;
+
+    // Same update coefficient Cb as update_E.comp (edge materials + PML).
+    uvec4 m = texelFetch(uEdgeMaterial, p, 0);
+    vec2 m0 = unpackHalf2x16(m.x), m1 = unpackHalf2x16(m.y), m2 = unpackHalf2x16(m.z);
+    vec3 sigma = max(vec3(m0.x, m0.y, m1.x), vec3(0.0));
+    vec3 epsR  = max(vec3(m1.y, m2.x, m2.y), vec3(1.0));
+    if (inPml(p)) {
+        vec3 pos = vec3(p);
+        sigma += vec3(pmlSigma(pos + vec3(0.5, 0.0, 0.0)),
+                      pmlSigma(pos + vec3(0.0, 0.5, 0.0)),
+                      pmlSigma(pos + vec3(0.0, 0.0, 0.5)));
+    }
+    vec3 dtEps = uDt / epsR;
+    vec3 cb = dtEps * phi(sigma * dtEps);
+
+    vec4 e = imageLoad(uEField, p);
+    imageStore(uEField, p, vec4(e.xyz - cb * J, e.w));
+}
