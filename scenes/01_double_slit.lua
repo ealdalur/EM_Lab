@@ -29,4 +29,4 @@ local mid = vec(0, grid.ny / 2, grid.nz / 2)
 probe      { position = mid:with("x", wall_x + 62), name = "screen centre" }
 flux_plane { axis = "x", position = wall_x + 42, name = "power through slits" }
 
-view { gain = 2.2, distance = 3.0, yaw = -58, pitch = 38 }
+view { gain = 3.4, distance = 3.0, yaw = -58, pitch = 38, steps_per_frame = 1}

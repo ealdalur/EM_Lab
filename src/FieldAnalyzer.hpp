@@ -56,9 +56,35 @@ struct FluxReading {
     double peakAbs = 0.0;       // max |P| seen since reset
 };
 
+// A batch of probe positions and flux surfaces measured together at one simulation time.
+struct MeasureRequest {
+    std::vector<glm::vec3> probes;
+    std::vector<FluxSurface> fluxes;
+    double time = 0.0;
+    std::uint64_t step = 0;
+};
+struct MeasureResult {
+    std::vector<ProbeSample> probes;
+    std::vector<double> fluxes;
+    double time = 0.0;
+    std::uint64_t step = 0;
+};
+
 class FieldAnalyzer {
 public:
     explicit FieldAnalyzer(const std::filesystem::path& shaderDir);
+    ~FieldAnalyzer();
+    FieldAnalyzer(const FieldAnalyzer&) = delete;
+    FieldAnalyzer& operator=(const FieldAnalyzer&) = delete;
+
+    // Non-blocking measurement: submit() queues one GPU pass for all probes and flux surfaces
+    // (with a fence); collect() returns the oldest finished batch. Waiting a frame for the
+    // result lets the CPU and GPU work in parallel instead of stalling on every readback.
+    // collect(..., true) blocks until the oldest pending batch is done.
+    void submit(const SimulationGrid& grid, const MeasureRequest& request);
+    bool collect(MeasureResult& out, bool wait);
+    void discard();
+    [[nodiscard]] bool pending() const noexcept;
 
     // GPU -> CPU readback of a 3x3x3 texel neighbourhood; trilinear interpolation
     // is performed per component at its own staggered location.
@@ -72,7 +98,32 @@ private:
     double planeFlux(const SimulationGrid& grid, int axis, int index, glm::ivec2 rectMin,
                      glm::ivec2 rectMax) const;
 
+    struct PlaneRef {
+        size_t flux = 0;   // index into the request's fluxes
+        double sign = 1.0; // outward orientation for boxes
+        size_t offset = 0, groups = 0;
+    };
+    struct Slot {
+        gl::Buffer origins, blocks, partials;
+        gl::ReadbackBuffer readback; // probe blocks, then flux partials
+        size_t originCap = 0, blockCap = 0, partialCap = 0;
+        GLsync fence = nullptr;
+        bool busy = false;
+        std::uint64_t serial = 0;
+        MeasureRequest request;
+        std::vector<glm::ivec3> origins3, extents;
+        std::vector<PlaneRef> planes;
+        size_t partialCount = 0;
+    };
+    // Dispatches one plane's reduction into `partials` at `offset`; returns its group count.
+    size_t dispatchPlane(const SimulationGrid& grid, int axis, int index, glm::ivec2 rectMin, glm::ivec2 rectMax,
+                         GLuint partials, size_t offset) const;
+    static size_t planeGroups(const SimulationGrid& grid, int axis, glm::ivec2 rectMin, glm::ivec2 rectMax);
+
     Shader m_fluxShader;
+    Shader m_gatherShader;
+    Slot m_slots[2];
+    std::uint64_t m_serial = 0;
     gl::Buffer m_partials;
     mutable size_t m_partialCapacity = 0; // partial-sum buffer capacity (floats)
     mutable std::vector<float> m_partialScratch;

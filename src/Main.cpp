@@ -50,8 +50,8 @@ struct Options {
     bool vsync = true;
     bool glDebug = false;
     bool listScenes = false;
-    int  width = 1600;
-    int  height = 900;
+    int  width = 1920;
+    int  height = 1080;
     std::string screenshot;  // save the last self-test frame to this BMP file
     std::string keys;        // key presses replayed at startup, for scripting/tests
 };
@@ -250,6 +250,7 @@ private:
     void loadSceneIndex(int index);
     void applyScene(ScriptResult&& result, bool newScene);
     void applyView(const Environment& env);
+    void applyViewChanges(const ViewHints& v); // reload: only the view settings the script changed
     void reloadWithParams();
     void checkHotReload();
     void handleEvent(const SDL_Event& e);
@@ -310,6 +311,9 @@ private:
     bool m_dragRotate = false;
     bool m_dragPan = false;
     bool m_screenshotRequested = false;
+    bool m_userRenderScale = false; // H pressed: keep the user's render resolution
+    ViewHints m_lastView;           // the script's view{} request at the last load
+    void autoRenderScale();
     std::uint64_t m_frame = 0;
 };
 
@@ -416,6 +420,7 @@ void Application::initWindowAndContext() {
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(m_window, &w, &h);
     m_fbSize = {w, h};
+    autoRenderScale();
     m_camera.setAspect(h > 0 ? static_cast<float>(w) / static_cast<float>(h) : 1.0f);
 }
 
@@ -510,6 +515,8 @@ void Application::applyScene(ScriptResult&& result, bool newScene) {
     m_cellSize = env.cellSize;
     m_referenceWavelength = env.referenceWavelength;
     if (newScene) applyView(env);
+    else applyViewChanges(env.view);
+    m_lastView = env.view;
 
     for (const std::string& w : result.warnings) std::fprintf(stderr, "  warning: %s\n", w.c_str());
     if (newScene) {
@@ -557,6 +564,28 @@ void Application::applyView(const Environment& env) {
     setFlyMode(false);
 }
 
+// On a reload the user's view (camera, gain, mode) is kept, except for settings the script now
+// requests differently than before: a script may tie them to a parameter, e.g. a brighter gain
+// for a pulse than for a continuous wave.
+void Application::applyViewChanges(const ViewHints& v) {
+    const ViewHints& o = m_lastView;
+    if (v.gainE != o.gainE && v.gainE) m_render.gainE = *v.gainE;
+    if (v.gainB != o.gainB && v.gainB) m_render.gainB = *v.gainB;
+    if (v.exposure != o.exposure && v.exposure) m_render.exposure = *v.exposure;
+    if (v.density != o.density && v.density) m_render.density = *v.density;
+    if (v.stepVoxels != o.stepVoxels && v.stepVoxels) m_render.stepVoxels = *v.stepVoxels;
+    if (v.overlay != o.overlay && v.overlay) m_render.showOverlay = *v.overlay;
+    if (v.mode != o.mode && v.mode) m_render.mode = static_cast<RenderSettings::Mode>(std::clamp(*v.mode, 0, 4));
+    if (v.signedAxis != o.signedAxis && v.signedAxis) m_render.signedAxis = *v.signedAxis;
+    if (v.stepsPerFrame != o.stepsPerFrame && v.stepsPerFrame) m_stepsPerFrame = *v.stepsPerFrame;
+    if (v.cameraDistance != o.cameraDistance || v.cameraYawDeg != o.cameraYawDeg || v.cameraPitchDeg != o.cameraPitchDeg ||
+        v.target != o.target) {
+        const glm::ivec3 g = m_gpu->grid.size();
+        const glm::vec3 target = VolumeRenderer::latticeToWorld(g, v.target.value_or(glm::vec3(g) * 0.5f));
+        m_camera.setOrbit(target, v.cameraDistance, v.cameraYawDeg, v.cameraPitchDeg);
+    }
+}
+
 void Application::reloadWithParams() {
     std::map<std::string, std::string> overrides;
     for (const ScriptParam& p : m_params) overrides[p.name] = p.overrideString();
@@ -600,6 +629,14 @@ void Application::printHelp() const {
         "  Script parameters use the keys listed under 'Parameters' (from: %s)\n\n",
         ScriptEngine::kParamKeys);
     printParams();
+}
+
+// The field volume is smooth, so rendering it below the window resolution is invisible while
+// the ray-marching cost falls with the pixel count. Lines and panels stay at full resolution.
+void Application::autoRenderScale() {
+    if (m_userRenderScale) return;
+    const double pixels = static_cast<double>(m_fbSize.x) * static_cast<double>(m_fbSize.y);
+    m_render.resolutionScale = pixels > 1.5e6 ? 0.5f : (pixels > 0.8e6 ? 0.75f : 1.0f);
 }
 
 void Application::setFlyMode(bool fly) {
@@ -658,13 +695,14 @@ void Application::handleKey(const SDL_KeyboardEvent& k) {
         case SDLK_O: m_render.showOverlay = !m_render.showOverlay; return;
         case SDLK_H:
             m_render.resolutionScale = m_render.resolutionScale < 0.99f ? 1.0f : 0.5f;
+            m_userRenderScale = true;
             std::printf("Render scale: %.2f\n", m_render.resolutionScale);
             return;
         case SDLK_F3: m_render.stepVoxels = std::max(m_render.stepVoxels / 1.25f, 0.1f);
                       std::printf("Ray step: %.2f voxels\n", m_render.stepVoxels); return;
         case SDLK_F4: m_render.stepVoxels = std::min(m_render.stepVoxels * 1.25f, 4.0f);
                       std::printf("Ray step: %.2f voxels\n", m_render.stepVoxels); return;
-        case SDLK_TAB: inst.selectNextProbe(); inst.measure(m_gpu->grid); inst.takeSnapshot(m_gpu->grid); return;
+        case SDLK_TAB: inst.selectNextProbe(); inst.measure(m_gpu->grid, true); inst.takeSnapshot(m_gpu->grid); return;
         case SDLK_LEFT:     inst.moveSelectedProbe({-probeStep, 0.0f, 0.0f}, gs); return;
         case SDLK_RIGHT:    inst.moveSelectedProbe({+probeStep, 0.0f, 0.0f}, gs); return;
         case SDLK_DOWN:     inst.moveSelectedProbe({0.0f, -probeStep, 0.0f}, gs); return;
@@ -672,7 +710,7 @@ void Application::handleKey(const SDL_KeyboardEvent& k) {
         case SDLK_PAGEDOWN: inst.moveSelectedProbe({0.0f, 0.0f, -probeStep}, gs); return;
         case SDLK_PAGEUP:   inst.moveSelectedProbe({0.0f, 0.0f, +probeStep}, gs); return;
         case SDLK_P:
-            inst.measure(m_gpu->grid);
+            inst.measure(m_gpu->grid, true);
             inst.evaluateFarField(m_gpu->grid);
             if (inst.hasSweep()) inst.evaluateSweep(m_gpu->grid);
             inst.printReport(m_gpu->grid);
@@ -703,6 +741,7 @@ void Application::handleEvent(const SDL_Event& e) {
         case SDL_EVENT_QUIT: m_running = false; break;
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             m_fbSize = {e.window.data1, e.window.data2};
+            autoRenderScale();
             if (m_fbSize.y > 0) m_camera.setAspect(static_cast<float>(m_fbSize.x) / static_cast<float>(m_fbSize.y));
             break;
         case SDL_EVENT_DROP_FILE:
@@ -977,7 +1016,7 @@ void Application::drawHelpWindow() {
         {"R", "reset fields"},                           {"[ / ]", "steps per frame"},
         {"- / +", "visual gain"},                        {"M", "render mode"},
         {"V", "signed-mode axis"},                       {"K / L", "cutaway (z) down / up"},
-        {"O", "overlay"},                                {"H", "half-resolution rendering"},
+        {"O", "overlay"},                                {"H", "full / half-resolution field rendering"},
         {"F3 / F4", "ray step size"},                    {"Tab", "select probe"},
         {"Arrows, PgUp/PgDn", "move the selected probe (Shift x5)"},
         {"P", "print the full measurement report to the console"},
@@ -1051,9 +1090,12 @@ int Application::run() {
         farFieldTimer += dt;
         if (inst.needsEveryStep() && (farFieldTimer > 1.0 || (m_opt.frames > 0 && m_frame % 50 == 49))) {
             farFieldTimer = 0.0;
-            inst.evaluateFarField(grid);
+            // Interactive: spread the far-field evaluation over a few frames (no stall).
+            if (m_opt.frames > 0) inst.evaluateFarField(grid);
+            else inst.beginFarFieldEvaluation();
             if (inst.hasSweep()) inst.evaluateSweep(grid);
         }
+        inst.advanceFarFieldEvaluation();
 
         // ---- render ----------------------------------------------------------
         m_gpu->renderTimer.begin();
@@ -1100,7 +1142,7 @@ int Application::run() {
         // unattended --frames runs print a periodic report instead.
         if (selfTest && m_frame % 100 == 0 && !inst.empty()) inst.printReport(grid);
         if (selfTest && m_frame >= static_cast<std::uint64_t>(m_opt.frames)) {
-            inst.measure(grid);
+            inst.measure(grid, true);
             inst.evaluateFarField(grid);
             if (inst.hasSweep()) inst.evaluateSweep(grid);
             if (!inst.empty()) inst.printReport(grid);

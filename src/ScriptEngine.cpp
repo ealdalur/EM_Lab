@@ -1841,9 +1841,16 @@ int api_radar(lua_State* L) {
     return 0;
 }
 
+// warning("text"): a message shown with the scene's warnings (Scene panel and console).
+int api_warning(lua_State* L) {
+    const char* msg = luaL_checkstring(L, 1);
+    warn(L, msg);
+    return 0;
+}
+
 int api_far_field(lua_State* L) {
     Args a(L, "far_field", {"min", "max", "center", "size", "margin", "wavelength", "frequency", "averaging", "name",
-                            "log"});
+                            "log", "axis"});
     lock(L);
     FarFieldSetup f;
     if (a.has("min") || a.has("max") || a.has("size")) {
@@ -1859,6 +1866,13 @@ int api_far_field(lua_State* L) {
     f.averagingPeriods = static_cast<float>(a.positive("averaging", 4.0));
     f.name = a.str("name", "far field");
     f.logPath = a.str("log", "");
+    if (auto ax = a.optDirection("axis")) {
+        const glm::vec3 d = glm::abs(*ax);
+        const int i = (d.x >= d.y && d.x >= d.z) ? 0 : (d.y >= d.z ? 1 : 2);
+        if (d[i] < 0.9999f) a.fail("axis must be along x, y or z (\"+x\", \"-z\", ...)");
+        f.mapAxis = glm::vec3(0.0f);
+        f.mapAxis[i] = (*ax)[i] > 0.0f ? 1.0f : -1.0f;
+    }
     if (ctx().builder->env().farField) warn(L, "far_field: only one far-field monitor is supported; replacing the previous one");
     ctx().builder->env().farField = f;
     a.checkUnknown();
@@ -1975,7 +1989,7 @@ void registerApi(lua_State* L) {
         {"array", wrap<api_array>},         {"current_source", wrap<api_current_source>},
         {"probe", wrap<api_probe>},         {"flux_plane", wrap<api_flux_plane>},
         {"flux_box", wrap<api_flux_box>},   {"far_field", wrap<api_far_field>},
-        {"radar", wrap<api_radar>},
+        {"radar", wrap<api_radar>},         {"warning", wrap<api_warning>},
     };
     for (const luaL_Reg& r : api) lua_register(L, r.name, r.func);
 

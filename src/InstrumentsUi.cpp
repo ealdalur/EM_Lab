@@ -477,7 +477,8 @@ void Instruments::drawArrayMap(ImFont* mono) {
     ImGui::Combo("show", &m_arrayMetric, metrics, 5);
     ImGui::SameLine();
     ImGui::TextColored(kDim, "(?)");
-    tooltip("Each cell is one element's feed, laid out as the array is built. In an array the impedance of an element "
+    tooltip("Each cell is one element's feed, laid out as seen from behind the array looking out along its boresight "
+            "(as the azimuth and elevation angles are defined). In an array the impedance of an element "
             "depends on what its neighbours do (mutual coupling), so it changes with the steering: this is the active "
             "(scan) impedance. A well-designed array keeps it matched over its scan range.");
 
@@ -529,8 +530,8 @@ void Instruments::drawArrayMap(ImFont* mono) {
     const float side = std::max(std::min(avail.x - scaleWidth, avail.y), 120.0f);
     if (ImPlot::BeginPlot("##array", ImVec2(side, side), ImPlotFlags_NoLegend)) {
         char xl[32], yl[32];
-        std::snprintf(xl, sizeof(xl), "element column (%c)", m_arrayAxes[0]);
-        std::snprintf(yl, sizeof(yl), "element row (%c)", m_arrayAxes[1]);
+        std::snprintf(xl, sizeof(xl), "column (toward %s)", m_arrayAxes[0].c_str());
+        std::snprintf(yl, sizeof(yl), "row (toward %s)", m_arrayAxes[1].c_str());
         ImPlot::SetupAxes(xl, yl, ImPlotAxisFlags_NoGridLines, ImPlotAxisFlags_NoGridLines);
         ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, cols, ImPlotCond_Always);
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, rows, ImPlotCond_Always);
@@ -572,11 +573,26 @@ void Instruments::drawRadar(ImFont* mono) {
                     "coupling between elements, reflections from fixed objects. It is subtracted from the next run, "
                     "leaving only the target echoes (clutter cancellation). It is reused while only the targets move.");
             ImGui::ProgressBar(static_cast<float>(radar.progress()), ImVec2(-1.0f, 0.0f));
+            if (radar.windowMeasured())
+                ImGui::TextColored(kDim, "listening window set from the antennas' measured ring-down: %zu steps",
+                                   radar.recordSteps());
+            else
+                ImGui::TextColored(kDim, "measuring the antennas' ring-down to set the listening window...");
             break;
-        case RadarMonitor::Phase::Measuring:
-            ImGui::TextColored(kWarn, "Measuring: pulse out, echoes back");
-            ImGui::ProgressBar(static_cast<float>(radar.progress()), ImVec2(-1.0f, 0.0f));
+        case RadarMonitor::Phase::Measuring: {
+            const double r = img.valid ? img.completeRange * cellMm : 0.0;
+            const double rmax = radar.setup().rangeMax * cellMm;
+            if (radar.recordedSteps() >= radar.recordSteps())
+                ImGui::TextColored(kWarn, "Echoes recorded: processing the final image...");
+            else
+                ImGui::TextColored(kWarn, "Measuring: image final out to %.0f mm of %.0f mm", r, rmax);
+            tooltip("The image fills in from near to far as the echoes arrive. An echo from range r has fully "
+                    "arrived once the recording reaches 2 r + the array's size + the radar's response length: "
+                    "everything nearer than the line is final and will not change; beyond it the image is "
+                    "still forming (dimmed). Detections appear once they are in the final part.");
+            ImGui::ProgressBar(static_cast<float>(rmax > 0.0 ? r / rmax : 0.0), ImVec2(-1.0f, 0.0f));
             break;
+        }
         default:
             ImGui::TextColored(kGood, "Image ready: %zu detection(s)", img.detections.size());
             ImGui::SameLine();
@@ -593,6 +609,18 @@ void Instruments::drawRadar(ImFont* mono) {
 
     const RadarSetup& rs = radar.setup();
     const float floorLine = img.floorDb + rs.thresholdDb;
+    auto axisLabel = [](const glm::vec3& v, const char* what) {
+        int i = 0;
+        for (int k = 1; k < 3; ++k)
+            if (std::abs(v[k]) > std::abs(v[i])) i = k;
+        static char buf[2][48];
+        static int slot = 0;
+        slot ^= 1;
+        std::snprintf(buf[slot], sizeof(buf[slot]), "%s (deg, toward %c%c)", what, v[i] >= 0.0f ? '+' : '-', "xyz"[i]);
+        return buf[slot];
+    };
+    const char* azLabel = axisLabel(radar.direction(90.0f, 0.0f), "azimuth");
+    const char* elLabel = axisLabel(radar.direction(0.0f, 90.0f), "elevation");
     if (ImGui::BeginTabBar("radarTabs")) {
         const float plotH = ImGui::GetContentRegionAvail().y - 9.5f * ImGui::GetFrameHeight();
         const ImVec2 plotSize(-1.0f, std::max(plotH, 160.0f));
@@ -606,11 +634,26 @@ void Instruments::drawRadar(ImFont* mono) {
                         std::max<double>(img.bscope[static_cast<size_t>(r) * img.naz + a], lo);
             ImPlot::PushColormap(ImPlotColormap_Viridis);
             if (ImPlot::BeginPlot("##bscope", plotSize, ImPlotFlags_NoLegend)) {
-                ImPlot::SetupAxes("azimuth (deg)", "range (mm)");
+                ImPlot::SetupAxes(azLabel, "range (mm)");
                 const double a0 = img.az0 - 0.5 * img.daz, a1 = img.az0 + (img.naz - 0.5) * img.daz;
                 const double r0 = (img.r0 - 0.5 * img.dr) * cellMm, r1 = (img.r0 + (img.nr - 0.5) * img.dr) * cellMm;
                 ImPlot::SetupAxesLimits(a0, a1, r0, r1, ImPlotCond_Always);
                 ImPlot::PlotHeatmap("B", v.data(), img.nr, img.naz, lo, 0.0, nullptr, ImPlotPoint(a0, r0), ImPlotPoint(a1, r1));
+                if (!img.complete) {
+                    // Not yet final beyond this range: dim it and mark the boundary.
+                    const double rc = img.completeRange * cellMm;
+                    const double xs[2] = {a0, a1}, top[2] = {r1, r1}, bottom[2] = {std::max(rc, r0), std::max(rc, r0)};
+                    ImPlotSpec shade;
+                    shade.FillColor = ImVec4(0.05f, 0.06f, 0.09f, 1.0f);
+                    shade.FillAlpha = 0.65f;
+                    shade.Flags = ImPlotItemFlags_NoLegend;
+                    ImPlot::PlotShaded("##pending", xs, bottom, top, 2, shade);
+                    ImPlotSpec edge;
+                    edge.LineColor = ImVec4(1.0f, 0.78f, 0.3f, 0.9f);
+                    edge.Flags = ImPlotItemFlags_NoLegend | ImPlotInfLinesFlags_Horizontal;
+                    ImPlot::PlotInfLines("##final", &rc, 1, edge);
+                    ImPlot::TagY(rc, ImVec4(0.55f, 0.42f, 0.15f, 1.0f), "final");
+                }
                 for (const RadarDetection& d : img.detections) {
                     const double x = d.azDeg, y = d.range * cellMm;
                     ImPlotSpec spec;
@@ -644,7 +687,7 @@ void Instruments::drawRadar(ImFont* mono) {
                         std::max<double>(img.cscope[static_cast<size_t>(e) * img.naz + a], lo);
             ImPlot::PushColormap(ImPlotColormap_Viridis);
             if (ImPlot::BeginPlot("##cscope", plotSize, ImPlotFlags_NoLegend | ImPlotFlags_Equal)) {
-                ImPlot::SetupAxes("azimuth (deg)", "elevation (deg)");
+                ImPlot::SetupAxes(azLabel, elLabel);
                 const double a0 = img.az0 - 0.5 * img.daz, a1 = img.az0 + (img.naz - 0.5) * img.daz;
                 const double e0 = img.el0 - 0.5 * img.del, e1 = img.el0 + (img.nel - 0.5) * img.del;
                 ImPlot::SetupAxesLimits(a0, a1, e0, e1, ImPlotCond_Always);
@@ -698,6 +741,14 @@ void Instruments::drawRadar(ImFont* mono) {
                 ImPlot::PlotInfLines("ref", lines, 2, ref);
                 ImPlot::TagY(img.floorDb, ImVec4(0.3f, 0.32f, 0.4f, 1.0f), "floor");
                 ImPlot::TagY(floorLine, ImVec4(0.55f, 0.35f, 0.2f, 1.0f), "threshold");
+                if (!img.complete) {
+                    const double rc = img.completeRange * cellMm;
+                    ImPlotSpec edge;
+                    edge.LineColor = ImVec4(1.0f, 0.78f, 0.3f, 0.9f);
+                    edge.Flags = ImPlotItemFlags_NoLegend;
+                    ImPlot::PlotInfLines("##final", &rc, 1, edge);
+                    ImPlot::TagX(rc, ImVec4(0.55f, 0.42f, 0.15f, 1.0f), "final");
+                }
                 ImPlot::EndPlot();
             }
             ImGui::TextColored(kDim, "Range resolution is set by the bandwidth: c / 2B = %.0f mm for this patch array's ~7%% band.",
@@ -733,7 +784,7 @@ void Instruments::drawRadar(ImFont* mono) {
     if (ImGui::BeginTable("detections", 6, kTableFlags)) {
         headers({{"#", "Detections, strongest first"},
                  {"range", "Distance from the array's transmit centre"},
-                 {"az / el", "Azimuth (toward +x) and elevation (toward +y) from boresight"},
+                 {"az / el", "Azimuth and elevation from boresight (directions as on the image axes)"},
                  {"level", "Relative to the strongest return / above the image floor"},
                  {"target", "Nearest object marked target = true"},
                  {"true nearest point", "Range and direction of the target's point nearest the radar: where a convex "
@@ -762,11 +813,21 @@ void Instruments::drawPatternPlot() {
     const FarFieldPattern& pat = m_farField.pattern();
     if (!pat.valid) return;
     if (!ImGui::BeginTabBar("patternTabs")) return;
-    if (ImGui::BeginTabItem("Beam map (+z)")) {
+    auto axisName = [](const glm::vec3& v) {
+        static const char* names[6] = {"+x", "+y", "+z", "-x", "-y", "-z"};
+        int i = 2;
+        for (int k = 0; k < 3; ++k)
+            if (std::abs(v[k]) > std::abs(v[i])) i = k;
+        return names[i + (v[i] < 0.0f ? 3 : 0)];
+    };
+    char front[48], back[48];
+    std::snprintf(front, sizeof(front), "Beam map (%s)###front", axisName(pat.mapNormal));
+    std::snprintf(back, sizeof(back), "Beam map (%s)###back", axisName(-pat.mapNormal));
+    if (ImGui::BeginTabItem(front)) {
         drawBeamMap(pat, true);
         ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem("Beam map (-z)")) {
+    if (ImGui::BeginTabItem(back)) {
         drawBeamMap(pat, false);
         ImGui::EndTabItem();
     }
@@ -780,8 +841,16 @@ void Instruments::drawPatternPlot() {
 void Instruments::drawBeamMap(const FarFieldPattern& pat, bool upper) {
     const auto& map = upper ? pat.mapUpperDbi : pat.mapLowerDbi;
     if (pat.mapSize < 2 || map.empty()) return;
-    ImGui::TextColored(kDim, "%s hemisphere: u = sin(theta) cos(phi), v = sin(theta) sin(phi); rings at theta 30, 60, 90 deg.",
-                       upper ? "+z" : "-z");
+    auto axisChar = [](const glm::vec3& v) {
+        int i = 0;
+        for (int k = 1; k < 3; ++k)
+            if (std::abs(v[k]) > std::abs(v[i])) i = k;
+        return "xyz"[i];
+    };
+    const glm::vec3 n = upper ? pat.mapNormal : -pat.mapNormal;
+    const char nc = axisChar(n), uc = axisChar(pat.mapU), vc = axisChar(pat.mapV);
+    ImGui::TextColored(kDim, "Hemisphere around %c%c: u, v = direction components along +%c, +%c; rings 30, 60, 90 deg off the %c axis.",
+                       n[0] + n[1] + n[2] > 0.0f ? '+' : '-', nc, uc, vc, nc);
     const double peak = pat.maxDirectivityDbi;
     const double lo = peak - 30.0;
     std::vector<double> vals(map.size());
@@ -791,7 +860,10 @@ void Instruments::drawBeamMap(const FarFieldPattern& pat, bool upper) {
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const float side = std::max(std::min(avail.x - scaleWidth, avail.y), 120.0f);
     if (ImPlot::BeginPlot("##beam", ImVec2(side, side), ImPlotFlags_NoLegend)) {
-        ImPlot::SetupAxes("u", "v");
+        char ul[24], vl[24];
+        std::snprintf(ul, sizeof(ul), "u (toward +%c)", uc);
+        std::snprintf(vl, sizeof(vl), "v (toward +%c)", vc);
+        ImPlot::SetupAxes(ul, vl);
         ImPlot::SetupAxesLimits(-1.05, 1.05, -1.05, 1.05, ImPlotCond_Always);
         ImPlot::PlotHeatmap("D", vals.data(), pat.mapSize, pat.mapSize, lo, peak, nullptr, ImPlotPoint(-1, -1), ImPlotPoint(1, 1));
         for (double th : {30.0, 60.0, 90.0}) {
@@ -807,18 +879,19 @@ void Instruments::drawBeamMap(const FarFieldPattern& pat, bool upper) {
             spec.Flags = ImPlotItemFlags_NoLegend;
             ImPlot::PlotLine("##ring", xs, ys, 97, spec);
         }
-        if (upper == (pat.maxDirection.z >= 0.0f)) {
-            const double mx = pat.maxDirection.x, my = pat.maxDirection.y;
+        if (upper == (glm::dot(pat.maxDirection, pat.mapNormal) >= 0.0f)) {
+            const double mx = glm::dot(pat.maxDirection, pat.mapU), my = glm::dot(pat.maxDirection, pat.mapV);
             ImPlotSpec spec;
             spec.Marker = ImPlotMarker_Cross;
             spec.MarkerSize = 8.0f;
             spec.MarkerLineColor = ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
             spec.Flags = ImPlotItemFlags_NoLegend;
             ImPlot::PlotScatter("##peak", &mx, &my, 1, spec);
-            const float theta = glm::degrees(std::acos(std::clamp(pat.maxDirection.z, -1.0f, 1.0f)));
-            const float phi = glm::degrees(std::atan2(pat.maxDirection.y, pat.maxDirection.x));
+            const float off = glm::degrees(std::acos(std::clamp(std::abs(glm::dot(pat.maxDirection, n)), 0.0f, 1.0f)));
+            const float around = glm::degrees(std::atan2(static_cast<float>(my), static_cast<float>(mx)));
             ImPlot::Annotation(mx, my, ImVec4(0.15f, 0.17f, 0.22f, 0.9f), ImVec2(14, -14), true,
-                               "peak %.1f dBi\ntheta %.0f, phi %.0f", peak, theta, phi);
+                               "peak %.1f dBi\n%.0f deg off %c%c, toward %.0f deg", peak, off,
+                               n[0] + n[1] + n[2] > 0.0f ? '+' : '-', nc, around);
         }
         ImPlot::EndPlot();
     }

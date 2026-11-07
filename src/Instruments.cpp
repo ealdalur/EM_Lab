@@ -35,6 +35,7 @@ std::unique_ptr<std::ofstream> Instruments::openLog(const std::string& path, con
 void Instruments::configure(const SimulationGrid& grid, const Environment& env, const fs::path& outputDir,
                             std::vector<std::string>& warnings, RadarMonitor::Start radarStart) {
     m_outputDir = outputDir;
+    m_analyzer.discard(); // measurements in flight belong to the previous configuration
     m_averagingTime = 3.0 * std::max(env.referenceWavelength, 2.0f);
     m_unstable = false;
 
@@ -123,11 +124,15 @@ void Instruments::detectArrayLayout() {
     const int ax = ports.front().axis;
     for (const PortSetup& p : ports)
         if (p.axis != ax) return;
-    const int u = ax == 0 ? 1 : 0, v = ax == 2 ? 1 : 2;
+    // Lay the elements out as seen from behind the array looking out along its feeds:
+    // columns run to the right, rows up (see boresightFrame).
+    glm::vec3 n(0.0f), right, up;
+    n[ax] = ports.front().sign >= 0.0f ? 1.0f : -1.0f;
+    boresightFrame(n, right, up);
     std::vector<int> us, vs;
     for (const PortSetup& p : ports) {
-        us.push_back(p.texel[u]);
-        vs.push_back(p.texel[v]);
+        us.push_back(static_cast<int>(std::lround(glm::dot(glm::vec3(p.texel), right))));
+        vs.push_back(static_cast<int>(std::lround(glm::dot(glm::vec3(p.texel), up))));
     }
     auto unique = [](std::vector<int> a) {
         std::sort(a.begin(), a.end());
@@ -150,8 +155,14 @@ void Instruments::detectArrayLayout() {
         }
         slot = static_cast<int>(i);
     }
-    m_arrayAxes[0] = "xyz"[u];
-    m_arrayAxes[1] = "xyz"[v];
+    auto name = [](const glm::vec3& d) {
+        int i = 0;
+        for (int k = 1; k < 3; ++k)
+            if (std::abs(d[k]) > std::abs(d[i])) i = k;
+        return std::string(d[i] >= 0.0f ? "+" : "-") + "xyz"[i];
+    };
+    m_arrayAxes[0] = name(right);
+    m_arrayAxes[1] = name(up);
 }
 
 void Instruments::onStep(const SimulationGrid& grid) {
@@ -180,13 +191,32 @@ void Instruments::resetHistory(const SimulationGrid& grid) {
     m_unstable = false;
 }
 
-void Instruments::measure(const SimulationGrid& grid) {
-    m_measureTime = grid.time();
-    m_measureStep = grid.stepCount();
+void Instruments::measure(const SimulationGrid& grid, bool wait) {
+    if (m_probes.empty() && m_fluxes.empty()) {
+        // Nothing to read back: the readouts' time stamp is simply now.
+        m_measureTime = grid.time();
+        m_measureStep = grid.stepCount();
+        return;
+    }
+    MeasureRequest req;
+    req.time = grid.time();
+    req.step = grid.stepCount();
+    for (const Probe& p : m_probes) req.probes.push_back(p.setup.position);
+    for (const Flux& f : m_fluxes) req.fluxes.push_back(f.setup.surface);
+    m_analyzer.submit(grid, req);
+    MeasureResult r;
+    while (m_analyzer.collect(r, wait)) applyMeasurement(r);
+}
+
+void Instruments::applyMeasurement(const MeasureResult& r) {
+    if (r.probes.size() != m_probes.size() || r.fluxes.size() != m_fluxes.size()) return; // scene changed meanwhile
+    m_measureTime = r.time;
+    m_measureStep = r.step;
     bool finite = true;
 
-    for (Probe& p : m_probes) {
-        p.sample = m_analyzer.probe(grid, p.setup.position);
+    for (size_t i = 0; i < m_probes.size(); ++i) {
+        Probe& p = m_probes[i];
+        p.sample = r.probes[i];
         const ProbeSample& s = p.sample;
         finite = finite && std::isfinite(glm::dot(s.E, s.E)) && std::isfinite(glm::dot(s.B, s.B));
         if (p.log)
@@ -195,21 +225,22 @@ void Instruments::measure(const SimulationGrid& grid) {
                    << s.S.x << ',' << s.S.y << ',' << s.S.z << '\n';
     }
 
-    for (Flux& f : m_fluxes) {
-        const double P = m_analyzer.measureFlux(grid, f.setup.surface);
+    for (size_t i = 0; i < m_fluxes.size(); ++i) {
+        Flux& f = m_fluxes[i];
+        const double P = r.fluxes[i];
         finite = finite && std::isfinite(P);
-        FluxReading& r = f.reading;
+        FluxReading& rd = f.reading;
         if (f.lastTime < 0.0 || m_measureTime < f.lastTime) {
-            r = {};
-            r.timeAveraged = P;
+            rd = {};
+            rd.timeAveraged = P;
         } else {
             const double a = 1.0 - std::exp(-(m_measureTime - f.lastTime) / m_averagingTime);
-            r.timeAveraged += a * (P - r.timeAveraged);
+            rd.timeAveraged += a * (P - rd.timeAveraged);
         }
-        r.instantaneous = P;
-        r.peakAbs = std::max(r.peakAbs, std::abs(P));
+        rd.instantaneous = P;
+        rd.peakAbs = std::max(rd.peakAbs, std::abs(P));
         f.lastTime = m_measureTime;
-        if (f.log) *f.log << m_measureStep << ',' << m_measureTime << ',' << P << ',' << r.timeAveraged << '\n';
+        if (f.log) *f.log << m_measureStep << ',' << m_measureTime << ',' << P << ',' << rd.timeAveraged << '\n';
     }
 
     if (!finite && !m_unstable) {
@@ -222,6 +253,11 @@ void Instruments::measure(const SimulationGrid& grid) {
 void Instruments::evaluateFarField(const SimulationGrid& grid) {
     if (m_farField.enabled()) m_farField.evaluate(grid);
     m_ports.evaluate();
+}
+
+void Instruments::beginFarFieldEvaluation() {
+    if (m_farField.enabled()) m_farField.beginEvaluation();
+    m_ports.beginEvaluate();
 }
 
 void Instruments::printAllPorts(const SimulationGrid& grid) const { printPorts(grid, m_ports.ports().size()); }
@@ -311,8 +347,10 @@ void Instruments::printRadar() const {
                         m_radar.recordSteps());
             return;
         case RadarMonitor::Phase::Measuring:
-            std::printf("    radar: measuring (%.0f%% of %zu steps)\n", 100.0 * m_radar.progress(), m_radar.recordSteps());
-            return;
+            std::printf("    radar: measuring (%.0f%% of %zu steps), image final out to %.1f mm\n", 100.0 * m_radar.progress(),
+                        m_radar.recordSteps(), img.valid ? img.completeRange * m_radar.cellSize() * 1e3 : 0.0);
+            if (!img.valid) return;
+            break;
         default: break;
     }
     if (!img.valid) {
@@ -494,7 +532,7 @@ void Instruments::appendOverlay(std::vector<LineVertex>& out, const glm::ivec3& 
         const glm::vec3 tx = m_radar.txCenter();
         VolumeRenderer::appendCross(out, W(tx), 3.0f * voxel, {0.5f, 1.0f, 0.5f, 0.9f});
         const RadarImage& img = m_radar.image();
-        if (img.valid && m_radar.phase() == RadarMonitor::Phase::Done)
+        if (img.valid) // detections appear as soon as they are in the final part of the image
             for (const RadarDetection& d : img.detections) {
                 VolumeRenderer::appendCross(out, W(d.position), 6.0f * voxel, hitColor);
                 out.push_back({W(tx), {1.0f, 0.25f, 0.25f, 0.35f}});

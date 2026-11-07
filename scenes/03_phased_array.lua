@@ -36,4 +36,4 @@ flux_plane { axis = "x", position = c.x + 40, min = {c.y - 12, c.z - 12}, max = 
              name = "broadside window" }
 far_field  {}
 
-view { gain = 45, distance = 3.0, yaw = -90, pitch = 62 }
+view { gain = 23, distance = 3.0, yaw = -90, pitch = 62, steps_per_frame = 1  }

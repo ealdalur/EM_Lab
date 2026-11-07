@@ -34,13 +34,16 @@ PortMonitor::PortMonitor(const fs::path& shaderDir)
       m_portBuffer(gl::createBuffer()),
       m_phasorBuffer(gl::createBuffer()),
       m_seriesBuffer(gl::createBuffer()) {
+    m_readback.ensure(sizeof(glm::vec4) * 2 * kMaxPorts);
     glNamedBufferData(m_portBuffer.get(), sizeof(GPUPort) * kMaxPorts, nullptr, GL_DYNAMIC_DRAW);
-    glNamedBufferData(m_phasorBuffer.get(), sizeof(glm::vec4) * 2 * kMaxPorts, nullptr, GL_DYNAMIC_READ); // read back by the CPU
+    glNamedBufferData(m_phasorBuffer.get(), sizeof(glm::vec4) * 2 * kMaxPorts, nullptr, GL_DYNAMIC_COPY); // GPU-resident; read back via a copy
     glNamedBufferData(m_seriesBuffer.get(), sizeof(glm::vec2), nullptr, GL_DYNAMIC_READ);
 }
 
 void PortMonitor::configure(const SimulationGrid& grid, const std::vector<PortSetup>& ports, float averagingPeriods,
                             const std::optional<SweepSetup>& sweep, float cellSize, size_t recordSteps) {
+    if (m_evalFence) glDeleteSync(m_evalFence);
+    m_evalFence = nullptr;
     m_ports.assign(ports.begin(), ports.begin() + std::min<size_t>(ports.size(), kMaxPorts));
     m_readings.assign(m_ports.size(), PortReading{});
     m_averagingPeriods = std::max(averagingPeriods, 0.5f);
@@ -71,7 +74,32 @@ void PortMonitor::configure(const SimulationGrid& grid, const std::vector<PortSe
     }
 }
 
+PortMonitor::~PortMonitor() {
+    if (m_evalFence) glDeleteSync(m_evalFence);
+}
+
+void PortMonitor::beginEvaluate() {
+    if (m_ports.empty() || m_evalFence) return;
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    m_readback.copyFrom(m_phasorBuffer.get(), m_ports.size() * 2 * sizeof(glm::vec4));
+    m_evalFence = gl::readbackFence();
+}
+
+void PortMonitor::pollEvaluate() {
+    if (!m_evalFence) return;
+    const GLenum state = glClientWaitSync(m_evalFence, 0, 0);
+    if (state != GL_ALREADY_SIGNALED && state != GL_CONDITION_SATISFIED) return;
+    glDeleteSync(m_evalFence);
+    m_evalFence = nullptr;
+    if (m_ports.empty()) return;
+    const auto* mapped = static_cast<const glm::vec4*>(m_readback.data());
+    const std::vector<glm::vec4> data(mapped, mapped + m_ports.size() * 2);
+    computeReadings(data);
+}
+
 void PortMonitor::disable() {
+    if (m_evalFence) glDeleteSync(m_evalFence);
+    m_evalFence = nullptr;
     m_ports.clear();
     m_readings.clear();
     m_sweepSetup.reset();
@@ -117,10 +145,19 @@ void PortMonitor::readSeries(std::vector<glm::vec2>& out) const {
 void PortMonitor::evaluate() {
     if (m_ports.empty()) return;
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-    std::vector<glm::vec4> data(m_ports.size() * 2);
-    glGetNamedBufferSubData(m_phasorBuffer.get(), 0, static_cast<GLsizeiptr>(data.size() * sizeof(glm::vec4)), data.data());
+    // Same route as the non-blocking path (copy into the mapped buffer, fence), but wait for it.
+    if (m_evalFence) glDeleteSync(m_evalFence);
+    m_readback.copyFrom(m_phasorBuffer.get(), m_ports.size() * 2 * sizeof(glm::vec4));
+    GLsync fence = gl::readbackFence();
+    glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, GLuint64(5'000'000'000));
+    glDeleteSync(fence);
+    m_evalFence = nullptr;
+    const auto* mapped = static_cast<const glm::vec4*>(m_readback.data());
+    computeReadings(std::vector<glm::vec4>(mapped, mapped + m_ports.size() * 2));
+}
 
-    for (size_t i = 0; i < m_ports.size(); ++i) {
+void PortMonitor::computeReadings(const std::vector<glm::vec4>& data) {
+    for (size_t i = 0; i < m_ports.size() && 2 * i + 1 < data.size(); ++i) {
         const PortSetup& p = m_ports[i];
         const glm::vec4 s2 = data[i * 2 + 1];
         PortReading r;

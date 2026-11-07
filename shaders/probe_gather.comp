@@ -1,0 +1,26 @@
+#version 460 core
+// =============================================================================
+// probe_gather.comp - copies the 3x3x3 E and B texel neighbourhood of every probe
+// into one buffer, so all probes are read back together, without stalling, a frame
+// later. The CPU interpolates each staggered component at the probe position.
+// Layout per probe: 27 E texels then 27 B texels, index (z * 3 + y) * 3 + x.
+// =============================================================================
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler3D uEField;
+layout(binding = 1) uniform sampler3D uBField;
+
+layout(std430, binding = 2) readonly restrict buffer OriginBuffer { ivec4 uOrigins[]; }; // xyz = block origin
+layout(std430, binding = 3) writeonly restrict buffer BlockBuffer { vec4 uBlocks[]; };
+
+uniform int   uProbeCount;
+uniform ivec3 uGridSize;
+
+void main() {
+    int id = int(gl_GlobalInvocationID.x);
+    if (id >= uProbeCount * 54) return;
+    int probe = id / 54, k = id % 54, t = k % 27;
+    ivec3 p = clamp(uOrigins[probe].xyz + ivec3(t % 3, (t / 3) % 3, t / 9), ivec3(0), uGridSize - 1);
+    uBlocks[id] = k < 27 ? texelFetch(uEField, p, 0) : texelFetch(uBField, p, 0);
+}

@@ -25,4 +25,4 @@ end
 probe      { position = vec(110, grid.ny / 2, grid.nz / 2), name = "behind grid" }
 flux_plane { axis = "x", position = 100, name = "transmitted" }
 
-view { gain = 1.8, distance = 2.8, yaw = -40, pitch = 25 }
+view { gain = 1.8, distance = 2.8, yaw = -40, pitch = 25, steps_per_frame = 1  }

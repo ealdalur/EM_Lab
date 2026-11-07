@@ -65,6 +65,41 @@ inline Buffer createBuffer() {
     return Buffer(id);
 }
 
+// Non-blocking GPU -> CPU readback: a persistently mapped, coherent buffer. The GPU copies
+// results into it; once a fence placed after the copy has signalled, the CPU reads the
+// mapped memory directly. No glGet*Data call, so the driver never drains its queue.
+class ReadbackBuffer {
+public:
+    void ensure(size_t bytes) {
+        if (bytes <= m_size && m_ptr) return;
+        const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        m_buffer = createBuffer(); // the old buffer (and its mapping) is released
+        glNamedBufferStorage(m_buffer.get(), static_cast<GLsizeiptr>(bytes), nullptr, flags);
+        m_ptr = glMapNamedBufferRange(m_buffer.get(), 0, static_cast<GLsizeiptr>(bytes), flags);
+        m_size = bytes;
+    }
+    // Queue a copy from `src`; follow with fence() and read data() once it has signalled.
+    void copyFrom(GLuint src, size_t bytes, size_t srcOffset = 0, size_t dstOffset = 0) {
+        ensure(dstOffset + bytes);
+        glCopyNamedBufferSubData(src, m_buffer.get(), static_cast<GLintptr>(srcOffset), static_cast<GLintptr>(dstOffset),
+                                 static_cast<GLsizeiptr>(bytes));
+    }
+    [[nodiscard]] const void* data() const noexcept { return m_ptr; }
+
+private:
+    Buffer m_buffer;
+    void* m_ptr = nullptr;
+    size_t m_size = 0;
+};
+
+// Fence after queued copies into ReadbackBuffers (makes the writes visible to the mapping).
+inline GLsync readbackFence() {
+    glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
+    GLsync f = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    return f;
+}
+
 inline Framebuffer createFramebuffer() {
     GLuint id = 0;
     glCreateFramebuffers(1, &id);

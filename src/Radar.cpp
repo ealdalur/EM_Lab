@@ -1,4 +1,5 @@
 #include "Radar.hpp"
+#include "FarField.hpp"
 #include "SimulationGrid.hpp"
 
 #include <glm/gtc/constants.hpp>
@@ -6,7 +7,9 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <random>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -106,6 +109,7 @@ glm::vec2 RadarMonitor::anglesOf(const glm::vec3& p) const {
 }
 
 void RadarMonitor::disable() {
+    waitJob();
     m_phase = Phase::Off;
     m_haveCalibration = m_haveMeasurement = false;
     m_cal.clear();
@@ -117,6 +121,7 @@ void RadarMonitor::disable() {
 void RadarMonitor::configure(const SimulationGrid& grid, const RadarSetup& setup, const std::vector<PortSetup>& elements,
                              const std::vector<SourceDesc>& sources, float wavelength, float cellSize,
                              const std::vector<TargetInfo>& targets, Start start, std::vector<std::string>& warnings) {
+    waitJob(); // the background processing reads this monitor's settings
     const Phase oldPhase = m_phase;
     m_setup = setup;
     m_targets = targets;
@@ -130,13 +135,14 @@ void RadarMonitor::configure(const SimulationGrid& grid, const RadarSetup& setup
         return;
     }
 
-    // Array frame: boresight along the feeds' direction; azimuth toward the next axis.
+    // Array frame: boresight along the feeds' direction; seen from behind the array looking out,
+    // azimuth is positive to the right and elevation positive up (see boresightFrame).
     const PortSetup& p0 = m_elements.front();
-    glm::vec3 n(0.0f), e1(0.0f);
+    glm::vec3 n(0.0f), right, up;
     n[p0.axis] = p0.sign >= 0.0f ? 1.0f : -1.0f;
-    e1[(p0.axis + 1) % 3] = 1.0f;
-    m_axes[0] = e1;
-    m_axes[1] = glm::cross(n, e1);
+    boresightFrame(n, right, up);
+    m_axes[0] = right;
+    m_axes[1] = up;
     m_axes[2] = n;
     m_elementPos.clear();
     for (const PortSetup& p : m_elements) {
@@ -223,6 +229,8 @@ void RadarMonitor::configure(const SimulationGrid& grid, const RadarSetup& setup
     // Image ranges: by default from one wavelength out to the absorbing layer along boresight.
     const glm::ivec3 gs = grid.size();
     const float L = static_cast<float>(grid.config().pmlThickness);
+    m_interiorMin = glm::vec3(L);
+    m_interiorMax = glm::vec3(gs) - L;
     const int ax = p0.axis;
     const float toEdge = n[ax] > 0.0f ? static_cast<float>(gs[ax]) - L - 2.0f - m_tx[ax] : m_tx[ax] - L - 1.0f;
     m_setup.rangeMax = setup.rangeMax > 0.0f ? setup.rangeMax : std::max(toEdge, 2.0f * m_wavelength);
@@ -235,16 +243,18 @@ void RadarMonitor::configure(const SimulationGrid& grid, const RadarSetup& setup
     m_reference = glm::round(m_tx + n * m_referenceDistance);
     m_referenceDistance = glm::length(m_reference - m_tx);
 
-    // Record the pulse, its round trip to the farthest range (plus the array's own extent), and
-    // a dozen periods for the antennas to ring down.
-    float extent = 0.0f;
-    for (const glm::vec3& p : m_elementPos) extent = std::max(extent, glm::length(p - m_tx));
-    const double T = tEnd + 2.0 * (m_setup.rangeMax + extent) + 12.0 * m_wavelength;
-    m_steps = static_cast<size_t>(std::ceil(T / m_dt));
+    // Listening window: the pulse, its round trip to the farthest range plus the array's extent,
+    // and the antennas' ring-down. The ring-down is measured during calibration (measureWindow);
+    // until then a generous provisional margin is used.
+    m_extent = 0.0;
+    for (const glm::vec3& p : m_elementPos) m_extent = std::max(m_extent, static_cast<double>(glm::length(p - m_tx)));
+    m_pulseEnd = tEnd;
+    const double provisional = tEnd + 2.0 * (m_setup.rangeMax + m_extent) + 24.0 * m_wavelength;
+    m_provisionalSteps = static_cast<size_t>(std::ceil(provisional / m_dt));
     // The transmitted drive waveform (drive-weighted mean of the pulsed feeds), at the times the
     // solver applies source currents: (n + 1/2) dt.
-    m_drive.assign(m_steps, 0.0);
-    for (size_t k = 0; k < m_steps; ++k) {
+    m_drive.assign(m_provisionalSteps, 0.0);
+    for (size_t k = 0; k < m_provisionalSteps; ++k) {
         double v = 0.0;
         for (const SourceDesc& s : m_txSources) v += static_cast<double>(s.amplitude) * s.signal((static_cast<double>(k) + 0.5) * m_dt);
         m_drive[k] = v / m_txWeight;
@@ -252,10 +262,9 @@ void RadarMonitor::configure(const SimulationGrid& grid, const RadarSetup& setup
 
     if (start == Start::Reprocess && oldPhase != Phase::Off) {
         // Only processing settings changed: re-process a finished measurement, or let the
-        // current recording pass (calibration or measurement) continue.
-        if (m_haveMeasurement) {
-            process();
-            m_phase = Phase::Done;
+        // current recording pass (calibration or measurement) continue with the new settings.
+        if (m_haveMeasurement && m_phase == Phase::Done) {
+            m_image = computeImage(m_meas, m_meas.size() / (m_elements.size() + kReferenceChannels), true);
             writeLog();
         }
         return;
@@ -263,6 +272,9 @@ void RadarMonitor::configure(const SimulationGrid& grid, const RadarSetup& setup
     if (start != Start::Calibrate && m_haveCalibration && !m_cal.empty()) {
         m_haveMeasurement = false;
         m_phase = Phase::Measuring;
+        m_steps = m_calSteps;
+        m_image = RadarImage{};
+        m_lastPartial = std::chrono::steady_clock::now();
         startRecording(grid);
         return;
     }
@@ -271,6 +283,9 @@ void RadarMonitor::configure(const SimulationGrid& grid, const RadarSetup& setup
     m_meas.clear();
     m_image = RadarImage{};
     m_phase = Phase::Calibrating;
+    m_steps = m_provisionalSteps;
+    m_windowMeasured = false;
+    m_lastWindowCheck = 0;
     startRecording(grid);
 }
 
@@ -305,18 +320,29 @@ bool RadarMonitor::calibrationComplete() const noexcept { return m_phase == Phas
 
 void RadarMonitor::beginMeasurement(const SimulationGrid& grid) {
     if (!m_haveCalibration) return;
+    waitJob();
     m_haveMeasurement = false;
     m_phase = Phase::Measuring;
+    m_steps = m_calSteps;
+    m_image = RadarImage{};
+    m_lastPartial = std::chrono::steady_clock::now();
     startRecording(grid);
 }
 
 void RadarMonitor::restart(const SimulationGrid& grid) {
     if (m_phase == Phase::Off) return;
+    waitJob();
     if (m_phase == Phase::Calibrating) {
         m_haveCalibration = false;
+        m_steps = m_provisionalSteps;
+        m_windowMeasured = false;
+        m_lastWindowCheck = 0;
     } else {
         m_phase = Phase::Measuring;
         m_haveMeasurement = false;
+        m_steps = m_calSteps;
+        m_image = RadarImage{};
+        m_lastPartial = std::chrono::steady_clock::now();
     }
     startRecording(grid);
 }
@@ -328,76 +354,151 @@ void RadarMonitor::readSeries(std::vector<float>& out) const {
     for (size_t i = 0; i < vi.size(); ++i) out[i] = vi[i].x;
 }
 
+void RadarMonitor::waitJob() {
+    if (!m_job.valid()) return;
+    m_job.wait();
+    (void)m_job.get(); // discard: whatever changes next makes it stale
+}
+
+void RadarMonitor::launch(bool final) {
+    const size_t CH = m_elements.size() + kReferenceChannels;
+    m_jobFinal = final;
+    m_job = std::async(std::launch::async, [this, meas = m_meas, n = m_meas.size() / CH, final]() {
+        return computeImage(meas, n, final);
+    });
+}
+
 void RadarMonitor::update() {
-    if (m_phase == Phase::Calibrating && !m_haveCalibration && m_recorder.recordedSteps() >= m_steps) {
-        readSeries(m_cal);
-        m_haveCalibration = true; // the application now swaps in the targets (beginMeasurement)
-    } else if (m_phase == Phase::Measuring && m_recorder.recordedSteps() >= m_steps) {
-        readSeries(m_meas);
-        m_haveMeasurement = true;
-        process();
-        m_phase = Phase::Done;
-        writeLog();
+    using namespace std::chrono;
+    // Collect a finished background image.
+    if (m_job.valid() && m_job.wait_for(seconds(0)) == std::future_status::ready) {
+        m_image = m_job.get();
+        if (m_jobFinal) {
+            m_phase = Phase::Done;
+            writeLog();
+        }
+    }
+    const size_t CH = m_elements.size() + kReferenceChannels;
+    const size_t recorded = m_recorder.recordedSteps();
+    if (m_phase == Phase::Calibrating && !m_haveCalibration) {
+        const size_t period = std::max<size_t>(16, static_cast<size_t>(m_wavelength / m_dt));
+        if (!m_windowMeasured && recorded >= m_lastWindowCheck + period) {
+            m_lastWindowCheck = recorded;
+            measureWindow();
+        }
+        if (recorded >= m_steps) {
+            readSeries(m_cal);
+            m_cal.resize(std::min(m_cal.size(), m_steps * CH));
+            m_calSteps = m_cal.size() / CH;
+            buildTemplate();
+            m_haveCalibration = true; // the application now swaps in the targets (beginMeasurement)
+        }
+    } else if (m_phase == Phase::Measuring && !m_job.valid()) {
+        if (recorded >= m_steps) {
+            readSeries(m_meas);
+            m_meas.resize(std::min(m_meas.size(), m_steps * CH));
+            m_haveMeasurement = true;
+            launch(true);
+        } else if (recorded > 0 && steady_clock::now() - m_lastPartial > milliseconds(500)) {
+            readSeries(m_meas); // the record so far: the image fills in from near to far
+            m_lastPartial = steady_clock::now();
+            launch(false);
+        }
     }
 }
 
-void RadarMonitor::process() {
-    RadarImage img;
+// Fidelity level of the record: echo contributions this far below a return's peak are
+// dropped. 10 dB below the detection dynamic range, so they cannot create, remove or move a
+// detection.
+double RadarMonitor::fidelityLevel() const { return std::pow(10.0, -(m_setup.dynamicRangeDb + 10.0) / 20.0); }
+
+// During calibration: once the timing reference (one-way: drive -> antennas -> 1.5 wavelengths
+// of space) has rung down below the fidelity level, the radar's two-way response length is
+// measured from the pulse-compression template built from the record so far. Both passes then
+// stop as soon as the echo from the farthest range has fully arrived.
+void RadarMonitor::measureWindow() {
+    std::vector<float> rec;
+    readSeries(rec);
     const size_t C = m_elements.size(), CH = C + kReferenceChannels;
-    const size_t N = std::min(m_cal.size(), m_meas.size()) / CH;
-    if (N < 32) {
-        m_image = img;
-        return;
-    }
-    const double dt = m_dt, w = glm::two_pi<double>() / m_wavelength;
-    auto timeOf = [dt](size_t n) { return static_cast<double>(n + 1) * dt; }; // E after step n + 1
-
-    // Transmit pulse at the elements, and the strongest echo (before noise).
-    double peakTx = 0.0, peakEcho = 0.0;
-    for (size_t n = 0; n < N; ++n)
-        for (size_t i = 0; i < C; ++i) {
-            peakTx = std::max(peakTx, static_cast<double>(std::abs(m_cal[n * CH + i])));
-            peakEcho = std::max(peakEcho, static_cast<double>(std::abs(m_meas[n * CH + i] - m_cal[n * CH + i])));
+    const size_t n = rec.size() / CH;
+    const size_t period = std::max<size_t>(1, static_cast<size_t>(std::lround(m_wavelength / m_dt)));
+    const size_t blocks = n / period;
+    if (blocks < 6) return;
+    const int best = referenceChannel(rec, n);
+    double peak = 0.0;
+    std::vector<double> blockMax(blocks, 0.0);
+    for (size_t b = 0; b < blocks; ++b)
+        for (size_t i = b * period; i < (b + 1) * period; ++i) {
+            blockMax[b] = std::max(blockMax[b], static_cast<double>(std::abs(rec[i * CH + C + static_cast<size_t>(best)])));
+            peak = std::max(peak, blockMax[b]);
         }
-    if (!(peakTx > 0.0)) {
-        m_image = img;
-        return;
-    }
-    img.echoDb = toDb((peakEcho / peakTx) * (peakEcho / peakTx));
-
-    // Pulse compression with a measured template. The calibration run's reference field on
-    // boresight is REF = S H exp(-jw R_ref): the drive spectrum S through the transmitting
-    // antennas H. A point target's echo is S H H exp(-jw path), since receiving has the same
-    // response as transmitting (reciprocity). So T = REF^2 / S, with R_ref removed, is the
-    // radar's complete two-way response, and correlating an echo with T peaks at exactly the
-    // path delay, whatever the antennas' group delay. The band window keeps the positive
-    // frequencies around the carrier (an analytic signal) and rejects out-of-band noise.
+    if (!(peak > 0.0)) return;
+    // Rung down: the last three periods are all below the fidelity level.
+    for (size_t b = blocks - 3; b < blocks; ++b)
+        if (blockMax[b] >= fidelityLevel() * peak) return;
     size_t F = 1;
-    while (F < 2 * N) F <<= 1;
-    const double dw = glm::two_pi<double>() / (static_cast<double>(F) * dt);
+    while (F < 2 * n) F <<= 1;
+    std::vector<std::complex<double>> templ;
+    buildTemplateSpectrum(rec, n, F, templ);
+    const double response = responseLength(templ);
+    const double window = 2.0 * m_setup.rangeMax + m_extent + response + m_wavelength;
+    m_steps = std::clamp(static_cast<size_t>(std::ceil(window / m_dt)), n, m_provisionalSteps);
+    m_windowMeasured = true;
+}
+
+int RadarMonitor::referenceChannel(const std::vector<float>& rec, size_t n) const {
+    const size_t C = m_elements.size(), CH = C + kReferenceChannels;
     int best = 0;
-    {
-        double bestPeak = -1.0;
-        for (int k = 0; k < kReferenceChannels; ++k) {
-            double pk = 0.0;
-            for (size_t n = 0; n < N; ++n) pk = std::max(pk, static_cast<double>(std::abs(m_cal[n * CH + C + k])));
-            if (pk > bestPeak) {
-                bestPeak = pk;
-                best = k;
-            }
+    double bestPeak = -1.0;
+    for (int k = 0; k < kReferenceChannels; ++k) {
+        double pk = 0.0;
+        for (size_t i = 0; i < n; ++i) pk = std::max(pk, static_cast<double>(std::abs(rec[i * CH + C + k])));
+        if (pk > bestPeak) {
+            bestPeak = pk;
+            best = k;
         }
     }
+    return best;
+}
+
+// Two-way response length: where the template's envelope stays below the fidelity level.
+double RadarMonitor::responseLength(const std::vector<std::complex<double>>& templ) const {
+    std::vector<std::complex<double>> t = templ;
+    fft(t, true);
+    const size_t half = t.size() / 2;
+    double tmax = 0.0;
+    for (size_t i = 0; i < half; ++i) tmax = std::max(tmax, std::abs(t[i]));
+    size_t last = 0;
+    for (size_t i = 0; i < half; ++i)
+        if (std::abs(t[i]) > fidelityLevel() * tmax) last = i;
+    return static_cast<double>(last + 1) * m_dt;
+}
+
+// After calibration: the pulse-compression filter. The calibration run's reference field on
+// boresight is REF = S H exp(-jw R_ref): the drive spectrum S through the transmitting
+// antennas H. A point target's echo is S H H exp(-jw path), since receiving has the same
+// response as transmitting (reciprocity). So T = REF^2 / S, with the propagation to the
+// reference removed, is the radar's complete two-way response; correlating an echo with T
+// peaks at exactly the path delay, whatever the antennas' group delay. The band window keeps
+// the positive frequencies around the carrier (an analytic signal) and rejects out-of-band noise.
+// The template spectrum T = REF^2 / S (with the propagation to the reference removed) from the
+// first n samples of a calibration record, on an F-point frequency grid.
+void RadarMonitor::buildTemplateSpectrum(const std::vector<float>& rec, size_t n, size_t F,
+                                         std::vector<std::complex<double>>& templ) const {
+    const size_t C = m_elements.size(), CH = C + kReferenceChannels;
+    const double dt = m_dt, w = glm::two_pi<double>() / m_wavelength;
+    const double dw = glm::two_pi<double>() / (static_cast<double>(F) * dt);
+    const int best = referenceChannel(rec, n);
     std::vector<std::complex<double>> ref(F), drive(F);
-    for (size_t n = 0; n < N; ++n) {
-        ref[n] = m_cal[n * CH + C + static_cast<size_t>(best)];
-        if (n < m_drive.size()) drive[n] = m_drive[n];
+    for (size_t i = 0; i < n; ++i) {
+        ref[i] = rec[i * CH + C + static_cast<size_t>(best)];
+        if (i < m_drive.size()) drive[i] = m_drive[i];
     }
     fft(ref, false);
     fft(drive, false);
     double driveMax = 0.0;
     for (const auto& v : drive) driveMax = std::max(driveMax, std::abs(v));
-    std::vector<std::complex<double>> filter(F, 0.0); // conj(T) x band window
-    std::vector<std::complex<double>> templ(F, 0.0);
+    templ.assign(F, 0.0);
     // Propagation from the transmitting elements to the reference point (its near-field array
     // factor) is divided out, leaving the drive through one element's response. Within a big
     // aperture's Fresnel zone that factor dips at some frequencies: regularize the division.
@@ -410,41 +511,91 @@ void RadarMonitor::process() {
         afMax = std::max(afMax, std::abs(refAf[k]));
     }
     for (size_t k = 1; k < F / 2; ++k) {
-        const double om = static_cast<double>(k) * dw;
         const std::complex<double> af = refAf[k];
         if (std::abs(af) < 1e-12) continue;
         const std::complex<double> r = ref[k] * std::conj(af) / (std::norm(af) + 0.05 * afMax * afMax);
         templ[k] = r * r * std::conj(drive[k]) / (std::norm(drive[k]) + 1e-8 * driveMax * driveMax);
+    }
+}
+
+// After calibration: the pulse-compression filter. The calibration run's reference field on
+// boresight is REF = S H exp(-jw R_ref): the drive spectrum S through the transmitting
+// antennas H. A point target's echo is S H H exp(-jw path), since receiving has the same
+// response as transmitting (reciprocity). So the template T = REF^2 / S is the radar's
+// complete two-way response; correlating an echo with T peaks at exactly the path delay,
+// whatever the antennas' group delay. The band window keeps the positive frequencies around
+// the carrier (an analytic signal) and rejects out-of-band noise.
+void RadarMonitor::buildTemplate() {
+    const size_t C = m_elements.size(), CH = C + kReferenceChannels;
+    const size_t N = m_calSteps;
+    const double dt = m_dt, w = glm::two_pi<double>() / m_wavelength;
+    m_peakTx = 0.0;
+    for (size_t n = 0; n < N; ++n)
+        for (size_t i = 0; i < C; ++i) m_peakTx = std::max(m_peakTx, static_cast<double>(std::abs(m_cal[n * CH + i])));
+    size_t F = 1;
+    while (F < 2 * N) F <<= 1;
+    m_fftSize = F;
+    const double dw = glm::two_pi<double>() / (static_cast<double>(F) * dt);
+    std::vector<std::complex<double>> templ;
+    buildTemplateSpectrum(m_cal, N, F, templ);
+    m_filter.assign(F, 0.0);
+    for (size_t k = 1; k < F / 2; ++k) {
+        const double om = static_cast<double>(k) * dw;
         const double band = std::exp(-std::pow((om - w) / (0.3 * w), 2.0));
-        filter[k] = std::conj(templ[k]) * band;
+        m_filter[k] = std::conj(templ[k]) * band;
     }
     {
-        // Two-way antenna group delay at the carrier (for display): the template's delay minus the
-        // pulse centre.
+        // Two-way antenna group delay at the carrier (for display): template delay minus pulse centre.
         const size_t k0 = std::clamp<size_t>(static_cast<size_t>(std::lround(w / dw)), 2, F / 2 - 2);
         const double slope = std::arg(templ[k0 + 1] * std::conj(templ[k0 - 1])) / (2.0 * dw);
-        img.systemDelay = static_cast<float>(-slope - m_txTime);
+        m_systemDelay = static_cast<float>(-slope - m_txTime);
     }
+    m_templateEnd = responseLength(templ); // for the progressive display's "final" range
+}
+
+RadarImage RadarMonitor::computeImage(const std::vector<float>& meas, size_t nMeas, bool final) const {
+    RadarImage img;
+    const size_t C = m_elements.size(), CH = C + kReferenceChannels;
+    const size_t N = std::min({nMeas, m_calSteps, meas.size() / CH});
+    if (N < 32 || m_fftSize < 2 * N || !(m_peakTx > 0.0)) return img;
+    const double dt = m_dt, w = glm::two_pi<double>() / m_wavelength;
+    auto timeOf = [dt](size_t n) { return static_cast<double>(n + 1) * dt; }; // E after step n + 1
+    const double peakTx = m_peakTx;
+    img.systemDelay = m_systemDelay;
+    img.recordedTime = static_cast<double>(N) * dt;
+    img.complete = final;
+    // Echoes out to this range have fully arrived (round trip + array extent + response length).
+    img.completeRange = final ? m_setup.rangeMax
+                              : static_cast<float>(std::clamp((img.recordedTime - m_templateEnd - m_extent) / 2.0, 0.0,
+                                                              static_cast<double>(m_setup.rangeMax)));
+
+    double peakEcho = 0.0;
+    for (size_t n = 0; n < N; ++n)
+        for (size_t i = 0; i < C; ++i)
+            peakEcho = std::max(peakEcho, static_cast<double>(std::abs(meas[n * CH + i] - m_cal[n * CH + i])));
+    img.echoDb = toDb((peakEcho / peakTx) * (peakEcho / peakTx));
 
     // Echoes (target run minus calibration run) plus receiver noise, compressed and decimated to
     // complex baseband: z(m) at path delay m D dt - dt / 2.
     // Receiver noise: white, scaled so that its rms within the radar's band (the noise bandwidth
-    // of the band window, 0.376 f0) is noiseDb below the transmit pulse peak at a port.
+    // of the band window, 0.376 f0) is noiseDb below the transmit pulse peak at a port. Each
+    // element has its own seeded generator, so a longer record extends the same noise.
     const double inBand = m_setup.noiseDb > -299.0f ? peakTx * std::pow(10.0, m_setup.noiseDb / 20.0) : 0.0;
     const double sigma = inBand * std::sqrt((0.5 / dt) / (0.376 / m_wavelength));
-    std::mt19937 rng(20251105u);
-    std::normal_distribution<double> gauss(0.0, 1.0);
+    const size_t F = m_fftSize;
     const size_t D = std::max<size_t>(1, static_cast<size_t>(std::lround(0.25 * m_wavelength / dt)));
     const size_t M = (N + D - 1) / D;
     std::vector<std::complex<float>> z(M * C);
     std::vector<std::complex<double>> buf(F);
     for (size_t i = 0; i < C; ++i) {
+        std::mt19937 rng(20251105u + static_cast<unsigned>(i));
+        std::normal_distribution<double> gauss(0.0, 1.0);
         std::fill(buf.begin(), buf.end(), std::complex<double>(0.0));
         for (size_t n = 0; n < N; ++n)
-            buf[n] = static_cast<double>(m_meas[n * CH + i]) - static_cast<double>(m_cal[n * CH + i]) +
+            buf[n] = static_cast<double>(meas[n * CH + i]) - static_cast<double>(m_cal[n * CH + i]) +
                      (sigma > 0.0 ? sigma * gauss(rng) : 0.0);
         fft(buf, false);
-        for (size_t k = 0; k < F; ++k) buf[k] *= filter[k];
+        for (size_t k = 0; k < F; ++k) buf[k] *= m_filter[k];
         fft(buf, true);
         for (size_t m = 0; m < M; ++m) {
             const double lag = static_cast<double>(m * D) * dt - 0.5 * dt;
@@ -465,12 +616,20 @@ void RadarMonitor::process() {
     const size_t total = static_cast<size_t>(img.nr) * img.nel * img.naz;
     std::vector<double> power(total, 0.0);
     const double sampleDt = static_cast<double>(D) * dt;
-    for (int ie = 0; ie < img.nel; ++ie)
+    // Elevation rows are independent: spread them over the CPU cores.
+    auto rows = [&](int ieBegin, int ieEnd) {
+    for (int ie = ieBegin; ie < ieEnd; ++ie)
         for (int ia = 0; ia < img.naz; ++ia) {
             const glm::vec3 dir = direction(img.az0 + ia * img.daz, img.el0 + ie * img.del);
             for (int ir = 0; ir < img.nr; ++ir) {
                 const float r = img.r0 + ir * dr;
                 const glm::vec3 P = m_tx + r * dir;
+                // The image only covers the simulated volume: outside it nothing can scatter, and
+                // the absorbing layer's small reflections would show up as false returns.
+                if (glm::any(glm::lessThan(P, m_interiorMin)) || glm::any(glm::greaterThan(P, m_interiorMax))) {
+                    power[(static_cast<size_t>(ir) * img.nel + ie) * img.naz + ia] = -1.0;
+                    continue;
+                }
                 const double outbound = txDelay(P);
                 std::complex<double> sum(0.0);
                 for (size_t i = 0; i < C; ++i) {
@@ -485,22 +644,41 @@ void RadarMonitor::process() {
                 power[(static_cast<size_t>(ir) * img.nel + ie) * img.naz + ia] = std::norm(sum);
             }
         }
-
-    // Levels relative to the strongest return; the median is the floor.
-    const double pmax = *std::max_element(power.begin(), power.end());
-    if (!(pmax > 0.0)) {
-        m_image = img;
-        return;
+    };
+    const int workers = std::clamp(static_cast<int>(std::thread::hardware_concurrency()), 1, img.nel);
+    std::vector<std::thread> pool;
+    for (int t = 0; t < workers; ++t) {
+        const int b = img.nel * t / workers, e = img.nel * (t + 1) / workers;
+        if (t + 1 < workers) pool.emplace_back(rows, b, e);
+        else rows(b, e);
     }
+    for (std::thread& th : pool) th.join();
+
+    // Levels relative to the strongest return in the final part of the image; the median of the
+    // final part is the floor. Points outside the simulated volume are marked -1.
+    const int finalBins = final ? img.nr
+                                : std::clamp(static_cast<int>(std::floor((img.completeRange - img.r0) / dr)) + 1, 0, img.nr);
+    double pmax = 0.0, pmaxAll = 0.0;
+    for (size_t k = 0; k < total; ++k) {
+        pmaxAll = std::max(pmaxAll, power[k]);
+        if (static_cast<int>(k / (static_cast<size_t>(img.nel) * img.naz)) < finalBins) pmax = std::max(pmax, power[k]);
+    }
+    if (!(pmax > 0.0)) pmax = pmaxAll;
+    if (!(pmax > 0.0)) return img;
     img.powerDb.resize(total);
-    for (size_t k = 0; k < total; ++k) img.powerDb[k] = toDb(power[k] / pmax);
-    {
-        std::vector<float> sorted = img.powerDb;
-        std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
-        img.floorDb = sorted[sorted.size() / 2];
+    std::vector<float> inside;
+    for (size_t k = 0; k < total; ++k) {
+        img.powerDb[k] = power[k] < 0.0 ? -3000.0f : toDb(power[k] / pmax);
+        if (power[k] >= 0.0 && static_cast<int>(k / (static_cast<size_t>(img.nel) * img.naz)) < finalBins)
+            inside.push_back(img.powerDb[k]);
+    }
+    if (inside.size() >= 16) {
+        std::nth_element(inside.begin(), inside.begin() + inside.size() / 2, inside.end());
+        img.floorDb = inside[inside.size() / 2];
     }
 
-    // Detections: local maxima above the floor + threshold and within the dynamic range.
+    // Detections in the final part: local maxima above the floor + threshold and within the
+    // dynamic range of the strongest return.
     auto at = [&](int ir, int ie, int ia) {
         ir = std::clamp(ir, 0, img.nr - 1);
         ie = std::clamp(ie, 0, img.nel - 1);
@@ -508,11 +686,10 @@ void RadarMonitor::process() {
         return img.powerDb[(static_cast<size_t>(ir) * img.nel + ie) * img.naz + ia];
     };
     const float minLevel = std::max(img.floorDb + m_setup.thresholdDb, -m_setup.dynamicRangeDb);
-    for (int ir = 0; ir < img.nr; ++ir)
+    const int lastBin = std::min(img.nr - 1, finalBins - 1); // the last final bin is an edge too
+    for (int ir = 1; ir < lastBin && inside.size() >= 16; ++ir)
         for (int ie = 0; ie < img.nel; ++ie)
             for (int ia = 0; ia < img.naz; ++ia) {
-                // Maxima on the first or last range bin are the edges of returns outside the image.
-                if (ir == 0 || ir == img.nr - 1) continue;
                 const float v = at(ir, ie, ia);
                 if (v < minLevel) continue;
                 bool peak = true;
@@ -543,7 +720,7 @@ void RadarMonitor::process() {
               [](const RadarDetection& a, const RadarDetection& b) { return a.relDb > b.relDb; });
     if (img.detections.size() > kMaxDetections) img.detections.resize(kMaxDetections);
 
-    // Truth: the nearest marked target, its front-surface range and its centre's direction.
+    // Truth: the nearest marked target and its point nearest the radar.
     for (RadarDetection& d : img.detections) {
         float nearest = 1e30f;
         for (size_t t = 0; t < m_targets.size(); ++t) {
@@ -593,14 +770,14 @@ void RadarMonitor::process() {
         if (glm::length(m_elementPos[i] - m_tx) < glm::length(m_elementPos[ce] - m_tx)) ce = i;
     const size_t stride = std::max<size_t>(1, N / 1500);
     for (size_t n = 0; n < N; n += stride) {
-        const double cal = m_cal[n * CH + ce], meas = m_meas[n * CH + ce];
+        const double cal = m_cal[n * CH + ce], mv = meas[n * CH + ce];
         img.traceTime.push_back(static_cast<float>(timeOf(n) / m_wavelength));
         img.traceCal.push_back(static_cast<float>(cal / peakTx));
-        img.traceMeas.push_back(static_cast<float>(meas / peakTx));
-        img.traceEcho.push_back(static_cast<float>((meas - cal) / peakTx));
+        img.traceMeas.push_back(static_cast<float>(mv / peakTx));
+        img.traceEcho.push_back(static_cast<float>((mv - cal) / peakTx));
     }
     img.valid = true;
-    m_image = std::move(img);
+    return img;
 }
 
 void RadarMonitor::writeLog() const {

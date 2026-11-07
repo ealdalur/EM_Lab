@@ -17,7 +17,7 @@ local cage_on = param { name = "cage", label = "cage", default = true, key = "g"
 local pitch   = param { name = "pitch", label = "mesh pitch", default = 4, min = 3, max = 20, step = 1, keys = {",", "."} }
 
 local c    = vec(grid.nx / 2 + 8, grid.ny / 2, grid.nz / 2)
-local half = 12
+local half = 18
 
 plane_wave { axis = "x", position = 26, polarization = "z", amplitude = 0.6 }
 
@@ -29,4 +29,4 @@ probe { position = c + 0.5, name = "inside cage" }
 probe { position = c - vec(30, 0, 0), name = "outside" }
 flux_plane { axis = "x", position = c.x, min = {c.y - 8, c.z - 8}, max = {c.y + 8, c.z + 8}, name = "cage interior" }
 
-view { gain = 0.9, distance = 2.6, yaw = -35, pitch = 30 }
+view { gain = 0.9, distance = 2.6, yaw = -35, pitch = 30, steps_per_frame = 1 }

@@ -99,4 +99,4 @@ else
 end
 probe { position = vec(c.x, c.y, zg + h + 25), name = "broadside" }
 
-view { gain = pulse and 60 or 30, distance = 2.2, yaw = -55, pitch = 35, steps_per_frame = 8 }
+view { gain = pulse and 60 or 30, distance = 2.2, yaw = -55, pitch = 35, steps_per_frame = 1 }

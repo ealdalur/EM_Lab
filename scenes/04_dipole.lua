@@ -43,4 +43,4 @@ probe    { position = grid.center + vec(40, 0, 0), name = "broadside" }
 flux_box { center = grid.center, size = math.max(length + 16, 32), name = "radiated power" }
 far_field {}
 
-view { gain = 70, distance = 2.4, yaw = -60, pitch = 22, steps_per_frame = 8 }
+view { gain = 45, distance = 2.4, yaw = -60, pitch = 22, steps_per_frame = 1 }

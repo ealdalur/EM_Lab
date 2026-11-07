@@ -29,4 +29,4 @@ for z = zg + 4, grid.nz - grid.pml - 4, 8 do
   probe { position = vec(c.x + 40, c.y, z), name = string.format("z=%d", z) }
 end
 
-view { gain = 25, distance = 2.6, yaw = -90, pitch = 8, mode = "fields" }
+view { gain = 40, distance = 2.6, yaw = -90, pitch = 8, mode = "fields", steps_per_frame = 1 }

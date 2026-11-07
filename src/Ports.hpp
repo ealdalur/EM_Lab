@@ -93,12 +93,19 @@ public:
     [[nodiscard]] bool sweeping() const noexcept { return m_sweepSetup.has_value() && !m_ports.empty(); }
 
     void accumulate(const SimulationGrid& grid);  // after every completed step
-    void evaluate();                              // single-frequency readings (GPU -> CPU)
+    void evaluate();                              // single-frequency readings (GPU -> CPU), now
+    // Non-blocking: snapshot the phasors on the GPU (with a fence), then update the readings
+    // once that has finished; poll once per frame.
+    void beginEvaluate();
+    void pollEvaluate();
     void evaluateSweep(double dt);                // frequency sweep from the recorded series
     // Time series recording (sweeps, or `recordSteps` > 0 in configure): (V, I) per
     // [step][port] for the steps recorded so far.
     [[nodiscard]] size_t recordedSteps() const noexcept { return m_recorded; }
     void readSeries(std::vector<glm::vec2>& out) const;
+    ~PortMonitor();
+    PortMonitor(const PortMonitor&) = delete;
+    PortMonitor& operator=(const PortMonitor&) = delete;
 
     [[nodiscard]] const std::vector<PortSetup>& ports() const noexcept { return m_ports; }
     [[nodiscard]] const std::vector<PortReading>& readings() const noexcept { return m_readings; }
@@ -114,6 +121,9 @@ private:
     gl::Buffer m_portBuffer;
     gl::Buffer m_phasorBuffer;
     gl::Buffer m_seriesBuffer;
+    gl::ReadbackBuffer m_readback;   // phasor snapshot for the non-blocking evaluation
+    GLsync m_evalFence = nullptr;
+    void computeReadings(const std::vector<glm::vec4>& data);
     std::vector<PortSetup> m_ports;
     std::vector<PortReading> m_readings;
     float m_wavelength = 16.0f;

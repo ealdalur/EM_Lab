@@ -1,6 +1,6 @@
 #version 460 core
 // =============================================================================
-// ntff_pattern.comp - far-field radiation integrals, one workgroup per direction.
+// ntff_pattern.comp - far-field radiation integrals, stage 1 of 2 (partial sums).
 //
 // Equivalent surface currents on the Huygens box (outward normal n):
 //     J = n x H,   M = -n x E
@@ -9,81 +9,102 @@
 // Far field (eta = 1):  E_far ~ -i k e^{-ikr}/(4 pi r) * (eta N_perp - r x L), so the
 // radiation intensity is U = k^2 / (32 pi^2) * |N_perp - r x L|^2.
 //
-// Every workgroup also accumulates the radiated power through the box,
-//     P = 1/2 sum Re{ (E x H*) . n } dA,
-// which keeps control flow uniform (no divergent barriers). Output per direction:
-//     uOut[2 g] = |N_perp - r x L|^2,   uOut[2 g + 1] = P.
+// Work split: workgroup (x, y) handles 128 directions (x) over one slice of the box surface
+// (y). The slice is streamed through shared memory 128 points at a time, and every thread adds
+// the tile's contribution to its own direction. Many slices keep the whole GPU busy even for a
+// few directions; ntff_reduce.comp then adds the slices up.
+//
+// Partial output per (direction, slice): N re/im, L re/im (4 x vec4), and for the dispatch that
+// starts at direction 0 the slice's radiated power  P = 1/2 sum Re{ (E x H*) . n } dA  in
+// the w component of N re (direction 0's entry).
 // =============================================================================
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#define TILE 128
+layout(local_size_x = TILE, local_size_y = 1, local_size_z = 1) in;
 
 #include "ntff_common.glsl"
 
 layout(std430, binding = 3) readonly restrict buffer PhasorBuffer { PhasorPair uPhasors[]; };
 layout(std430, binding = 4) readonly restrict buffer DirectionBuffer { vec4 uDirections[]; };
-layout(std430, binding = 5) writeonly restrict buffer OutputBuffer { float uOut[]; };
+layout(std430, binding = 5) writeonly restrict buffer PartialBuffer { vec4 uPartials[]; };
 
 uniform int  uPointCount;
-uniform float uK;       // vacuum wavenumber (rad / cell)
-uniform vec3 uCenter;   // phase reference (box centre, lattice units)
+uniform int  uDirectionOffset; // first direction of this dispatch
+uniform int  uDirectionCount;  // one past the last direction of this dispatch
+uniform int  uSlices;          // number of surface slices (workgroups along y)
+uniform float uK;              // vacuum wavenumber (rad / cell)
+uniform vec3 uCenter;          // phase reference (box centre, lattice units)
 
-shared vec3  sNr[256];
-shared vec3  sNi[256];
-shared vec3  sLr[256];
-shared vec3  sLi[256];
-shared float sP[256];
+shared vec4  sPos[TILE];  // xyz = point - centre
+shared vec4  sJr[TILE];
+shared vec4  sJi[TILE];
+shared vec4  sMr[TILE];
+shared vec4  sMi[TILE];
+shared float sP[TILE];
 
 void main() {
-    uint g   = gl_WorkGroupID.x;
-    uint lid = gl_LocalInvocationIndex;
-    vec3 r   = uDirections[g].xyz;
+    uint lid   = gl_LocalInvocationIndex;
+    uint local = gl_WorkGroupID.x * uint(TILE) + lid;       // direction within this dispatch
+    uint d     = uint(uDirectionOffset) + local;
+    uint slice = gl_WorkGroupID.y;
+    bool inRange = d < uint(uDirectionCount);
+    vec3 r = inRange ? uDirections[d].xyz : vec3(0.0, 0.0, 1.0);
+    bool power = gl_WorkGroupID.x == 0u && uDirectionOffset == 0;
+
+    // This slice's share of the surface points.
+    int per   = (uPointCount + uSlices - 1) / uSlices;
+    int first = int(slice) * per;
+    int last  = min(first + per, uPointCount);
 
     vec3 Nr = vec3(0.0), Ni = vec3(0.0), Lr = vec3(0.0), Li = vec3(0.0);
     float P = 0.0;
 
-    for (int i = int(lid); i < uPointCount; i += 256) {
-        ivec3 node;
-        vec3 n;
-        float w; // trapezoid area weight dA
-        ntffPoint(i, node, n, w);
-        Phasor ph = uPhasors[i].stage2;
+    for (int base = first; base < last; base += TILE) {
+        int i = base + int(lid);
+        if (i < last) {
+            ivec3 node;
+            vec3 n;
+            float w; // trapezoid area weight dA
+            ntffPoint(i, node, n, w);
+            Phasor ph = uPhasors[i].stage2;
+            sPos[lid] = vec4(vec3(node) - uCenter, 0.0);
+            sJr[lid]  = vec4( w * cross(n, ph.hRe.xyz), 0.0);
+            sJi[lid]  = vec4( w * cross(n, ph.hIm.xyz), 0.0);
+            sMr[lid]  = vec4(-w * cross(n, ph.eRe.xyz), 0.0);
+            sMi[lid]  = vec4(-w * cross(n, ph.eIm.xyz), 0.0);
+            if (power) P += w * dot(cross(ph.eRe.xyz, ph.hRe.xyz) + cross(ph.eIm.xyz, ph.hIm.xyz), n);
+        }
+        memoryBarrierShared();
+        barrier();
 
-        vec3 Jr =  w * cross(n, ph.hRe.xyz), Ji =  w * cross(n, ph.hIm.xyz);
-        vec3 Mr = -w * cross(n, ph.eRe.xyz), Mi = -w * cross(n, ph.eIm.xyz);
-
-        float psi = uK * dot(r, vec3(node) - uCenter);
-        float c = cos(psi), s = sin(psi);
-        Nr += Jr * c - Ji * s;
-        Ni += Jr * s + Ji * c;
-        Lr += Mr * c - Mi * s;
-        Li += Mr * s + Mi * c;
-
-        P += w * dot(cross(ph.eRe.xyz, ph.hRe.xyz) + cross(ph.eIm.xyz, ph.hIm.xyz), n);
+        int count = min(TILE, last - base);
+        for (int k = 0; k < count; ++k) {
+            float psi = uK * dot(r, sPos[k].xyz);
+            float c = cos(psi), s = sin(psi);
+            vec3 jr = sJr[k].xyz, ji = sJi[k].xyz, mr = sMr[k].xyz, mi = sMi[k].xyz;
+            Nr += jr * c - ji * s;
+            Ni += jr * s + ji * c;
+            Lr += mr * c - mi * s;
+            Li += mr * s + mi * c;
+        }
+        barrier(); // the tile is overwritten next iteration
     }
 
-    sNr[lid] = Nr; sNi[lid] = Ni; sLr[lid] = Lr; sLi[lid] = Li; sP[lid] = P;
+    // The slice's radiated power (workgroup x = 0 of the dispatch starting at direction 0).
+    sP[lid] = P;
     memoryBarrierShared();
     barrier();
+    for (uint stride = uint(TILE) / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) sP[lid] += sP[lid + stride];
+        memoryBarrierShared();
+        barrier();
+    }
 
-#define REDUCE_STEP(STRIDE)                                      \
-    if (lid < STRIDE##u) {                                       \
-        sNr[lid] += sNr[lid + STRIDE##u];                        \
-        sNi[lid] += sNi[lid + STRIDE##u];                        \
-        sLr[lid] += sLr[lid + STRIDE##u];                        \
-        sLi[lid] += sLi[lid + STRIDE##u];                        \
-        sP[lid]  += sP[lid + STRIDE##u];                         \
-    }                                                            \
-    memoryBarrierShared();                                       \
-    barrier();
-    REDUCE_STEP(128) REDUCE_STEP(64) REDUCE_STEP(32) REDUCE_STEP(16)
-    REDUCE_STEP(8)   REDUCE_STEP(4)  REDUCE_STEP(2)  REDUCE_STEP(1)
-#undef REDUCE_STEP
-
-    if (lid == 0u) {
-        vec3 nr = sNr[0], ni = sNi[0];
-        vec3 Fr = (nr - dot(nr, r) * r) - cross(r, sLr[0]);
-        vec3 Fi = (ni - dot(ni, r) * r) - cross(r, sLi[0]);
-        uOut[2u * g]      = dot(Fr, Fr) + dot(Fi, Fi);
-        uOut[2u * g + 1u] = 0.5 * sP[0];
+    if (inRange) {
+        uint o = 4u * (local * uint(uSlices) + slice);
+        uPartials[o]      = vec4(Nr, (power && lid == 0u) ? sP[0] : 0.0);
+        uPartials[o + 1u] = vec4(Ni, 0.0);
+        uPartials[o + 2u] = vec4(Lr, 0.0);
+        uPartials[o + 3u] = vec4(Li, 0.0);
     }
 }

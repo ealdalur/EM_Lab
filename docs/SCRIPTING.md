@@ -35,7 +35,7 @@ Contents:
 | Save the file | **Hot reload.** The script is re-run automatically about 0.5 s after you save it. **F5** reloads manually. |
 | `--set name=value` | Override a `param{}` at startup. Repeat the option for several parameters. |
 
-**Reloading.** If a reload changes only sources, instruments or view settings, the running fields are kept. That's how live beam steering works. If the grid size or any material changes, the fields are reset.
+**Reloading.** If a reload changes only sources, instruments or view settings, the running fields are kept. That's how live beam steering works. If the grid size or any material changes, the fields are reset. Your view (camera, gain, render mode) is kept across reloads too, except for `view{}` settings whose scripted value changed: a script can tie a setting to a parameter, e.g. `gain = pulse and 60 or 30`, and switching the parameter applies the new value.
 
 **Parameters on screen.** Every `param{}` also appears in the **Scene** panel as a slider, menu or checkbox with its key next to it. A slider re-runs the script when you release it.
 
@@ -82,6 +82,7 @@ Reading `grid` freezes the scene settings, so call `scene{}` first.
 | `lerp(a, b, t)`, `clamp(x, lo, hi)` | interpolation and clamping |
 | `range(a, b, step)` | inclusive numeric iterator: `for x in range(0, 1, 0.25) do ... end` |
 | `pi`, `c0` | π and the speed of light (m/s) |
+| `warning(text)` | Adds a warning to the scene's list (shown in the Scene panel and the console), e.g. when the script had to adjust a parameter. |
 
 The standard `math`, `string`, `table` and `utf8` libraries are available.
 
@@ -369,14 +370,14 @@ Results appear on screen in the **Instruments** window, as tables that update in
 | `probe{}` | `position`, `name`, `log` | E, B, S = E×B at a point, with exact Yee-staggered interpolation. Also the local σ and ε_r. | `step,time,Ex,Ey,Ez,Bx,By,Bz,absE,absB,Sx,Sy,Sz` |
 | `flux_plane{}` | `axis`, `position`, `min={u,v}`, `max={u,v}` (default: the full interior), `name`, `log` | Power through a rectangle, ∫ S·n dA, with n pointing toward +axis. Reported instantaneous and time-averaged (τ = 3 periods). | `step,time,P,P_avg` |
 | `flux_box{}` | `min`/`max` or `center`/`size`, `name`, `log` | **Net outward** power through a closed box. This is the radiated power of the sources inside, or minus the power absorbed by lossy objects inside. | `step,time,P,P_avg` |
-| `far_field{}` | box (`min`/`max` or `center`/`size`, default: the interior minus `margin=4`), `wavelength`/`frequency`, `averaging=4` (periods), `name`, `log` | **Antenna far field** via the near-to-far-field transform: radiation pattern, directivity D (dBi), total radiated power, principal-plane cuts with peak, −3 dB beamwidth and front/back ratio. Drawn as polar curves: xy orange, xz cyan, yz green, 30 dB scale. | `angle_deg,xy_dBi,xz_dBi,yz_dBi` |
+| `far_field{}` | box (`min`/`max` or `center`/`size`, default: the interior minus `margin=4`), `wavelength`/`frequency`, `averaging=4` (periods), `axis="+z"` (the antenna's boresight: centre of the front beam map), `name`, `log` | **Antenna far field** via the near-to-far-field transform: radiation pattern, directivity D (dBi), total radiated power, principal-plane cuts with peak, −3 dB beamwidth and front/back ratio. Drawn as polar curves: xy orange, xz cyan, yz green, 30 dB scale. | `angle_deg,xy_dBi,xz_dBi,yz_dBi` |
 
 Cut angles:
 - **xy**: measured from +x toward +y (azimuth).
 - **xz**: from +x toward +z.
 - **yz**: from +y toward +z.
 
-D_max is searched over the three cuts plus two **beam maps**: 81 × 81 grids in direction cosines u = sin θ cos φ, v = sin θ sin φ for each hemisphere (about 2° near broadside). The **Radiation pattern** window shows them as heatmaps with rings at θ = 30°, 60° and 90°, so a beam steered in any direction is visible, not only one in a principal plane. The Cuts tab plots the three principal planes in dBi.
+D_max is searched over the three cuts plus two **beam maps**: 81 × 81 grids in direction cosines for the hemisphere around `axis` and the one behind it (about 2° near the axis). The maps are drawn as seen from behind the antenna looking out along `axis`: u is the direction's component to the right, v its component up (up is +z, or +y for an axis along z). For `"+x"`, u is along −y and v along +z; for `"+z"`, u is along −x and v along +y. The **Radiation pattern** window shows them as heatmaps with rings at 30°, 60° and 90° from the axis, so a beam steered in any direction is visible, not only one in a principal plane. The Cuts tab plots the three principal planes in dBi.
 
 **Arrays.** When the ports form a regular rectangular lattice (a phased array), the **Array elements** window shows each element's active VSWR, S11, accepted power, R or X as a map laid out like the array. In an array, an element's impedance depends on how its neighbours are driven (mutual coupling), so it changes with steering: this is the active, or scan, impedance. `15_patch_array.lua` shows it.
 
@@ -397,7 +398,7 @@ radar    { range = {40, 200}, fov = 35, noise = -45, log = "detections.csv" }
 | Key | Default | Meaning |
 |---|---|---|
 | `range = {min, max}` | 1 λ to the absorber | Image range in cells from the transmit centre. |
-| `fov` | 40 | Image half-angle in degrees, or `{azimuth, elevation}`. Azimuth is measured from boresight toward the next axis (x for a z-facing array), elevation toward the third (y). |
+| `fov` | 40 | Image half-angle in degrees, or `{azimuth, elevation}`. Boresight is the feeds' direction. Angles are as seen from behind the array looking out along it: elevation is positive up (+z; +y for an array facing along z), azimuth positive to the right. For a +x-facing array (scene 16) azimuth is toward −y and elevation toward +z. |
 | `noise` | none | Receiver noise: rms within the radar's band, in dB relative to the transmit pulse peak at a port (e.g. `-45`). |
 | `threshold` | 13 | Detection threshold in dB above the image floor (the median level). |
 | `dynamic_range` | 25 | Detections must lie within this many dB of the strongest return. |
@@ -411,7 +412,11 @@ How it works:
 1. **Calibration (clutter cancellation).** The script is run a second time without the `target = true` objects, and the radar first transmits into that scene. This records everything that isn't a target: the pulse ringing in the feeds, coupling between elements, reflections from fixed structures. Then the targets are swapped in, the fields are reset, and the pulse is sent again. The difference of the two recordings is the echo.
 2. **Pulse compression.** During calibration, a reference point on boresight records the transmitted field. With the transmit array's near-field factor divided out, squared and divided by the drive spectrum, it gives the radar's complete two-way response T = S·H². Correlating each echo with T peaks at exactly the round-trip path delay, whatever the antennas' group delay.
 3. **Back-projection (digital beamforming).** For each point of a range × azimuth × elevation grid, the compressed echoes of all elements are taken at that point's exact round-trip delay and added coherently, with the receive taper. Because the geometry is exact, the image is focused in the array's near field too.
-4. **Detection.** Local maxima above the floor plus `threshold` and within `dynamic_range` of the strongest, refined between grid points. Each is matched with the nearest target and compared with the target's point nearest the radar. For a convex object, that's where the mirror-like (specular) "glint" return comes from.
+4. **Detection.** The image only covers the simulated volume: points outside the absorbing layer are left out. Then it finds local maxima above the floor plus `threshold` and within `dynamic_range` of the strongest, refined between grid points. Each is matched with the nearest target and compared with the target's point nearest the radar. For a convex object, that's where the mirror-like (specular) "glint" return comes from.
+
+**Listening window.** During calibration the radar watches the timing reference ring down. Once it has fallen below the fidelity level, the radar's two-way response length is measured: the length of its pulse-compression template down to that level. The fidelity level is 10 dB below `dynamic_range`, so dropped tails cannot create, remove or move a detection. Both passes then stop when the echo from the farthest range has fully arrived: 2 × range + the array's size + the response length. For the 8 × 8 patch array the response is about 18 periods; the board and the 64 coupled elements ring for a long time.
+
+**Progressive display.** While the target pass records, the image is recomputed about every half second from the record so far, on a background thread. An echo from range r has fully arrived once the record reaches 2r + the array's size + the response length. Everything nearer than that is **final**: it will not change when more data comes in. The Radar window states how far the image is final, marks the boundary with a "final" line on the range-azimuth image and the range profile, and dims the part beyond it. The noise floor and the detections use only the final part, so detections appear as soon as they are certain and never move afterwards.
 
 **Reuse.** The calibration is kept while only the targets change, so moving a target costs one pulse. Changing only processing settings (`noise`, `threshold`, `fov`, `taper`, `dynamic_range`) re-processes the stored echoes instantly, without re-simulating. **R** transmits again.
 
@@ -424,6 +429,10 @@ The **Radar** window shows the range-azimuth image (B-scope: strongest return ov
 | Sphere, plate, cylinder (2 × 2 transmitter) | −0.3, +1.3, 0.0 mm | < 1° |
 | Sphere at 4 λ, az 15°, el −10° | +2.4 mm | 2.5° az, 0.5° el (relative to the nearest point) |
 | Full 8 × 8 transmitter | +0.6 to +3.8 mm | < 0.5° |
+| Plate at 10 λ and 15 λ (scene depth 20 λ) | −4.8, −2.2 mm | < 0.3° |
+| Sphere at 10 λ / 15 λ / 19 λ | +0.7 / +19 / +13 mm | < 0.3° |
+
+At long range the sphere reads up to 0.6 λ long while the plate stays within 0.15 λ. A sphere is not a single point reflector: the wave creeping around its back returns within the same range cell as its mirror-like front return, and the nearest-surface truth ignores that. A strong target also shows a **multipath ghost** at about twice its range: the echo reflects off the metal array, goes back out and returns (−24 dB for the plate at 10 λ).
 
 Two spheres are resolved 30° apart and merge at 20°: the Hamming-tapered beam is about 19° wide. **Range resolution** is a different matter. Two targets at the same angle are only separated if they are c / 2B apart, where B is the bandwidth: about 7 λ for this patch array's 7% band, which is larger than the whole scene. Real radars use much wider-band waveforms for this.
 

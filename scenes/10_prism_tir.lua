@@ -34,4 +34,4 @@ flux_plane { axis = "x", position = x0 + S + 16, name = "refracted (through hypo
 flux_plane { axis = "y", position = y0 - 14,     name = "TIR output (bottom face)" }
 probe      { position = vec(x0 + S + 0.5 - (beam_y - y0), y0 - 20, cz), name = "below prism" }
 
-view { gain = 4.5, distance = 2.4, yaw = -90, pitch = 70 }
+view { gain = 4.5, distance = 2.4, yaw = -90, pitch = 70, steps_per_frame = 1 }

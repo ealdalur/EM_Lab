@@ -1,0 +1,39 @@
+#version 460 core
+// =============================================================================
+// ntff_reduce.comp - far-field radiation integrals, stage 2 of 2: adds up the surface
+// slices of ntff_pattern.comp for each direction and forms |N_perp - r x L|^2.
+// Output per direction: uOut[2 d] = |N_perp - r x L|^2, uOut[2 d + 1] = radiated power
+// (only meaningful for the dispatch that contains direction 0, see ntff_pattern.comp).
+// =============================================================================
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 4) readonly restrict buffer DirectionBuffer { vec4 uDirections[]; };
+layout(std430, binding = 5) readonly restrict buffer PartialBuffer { vec4 uPartials[]; };
+layout(std430, binding = 6) writeonly restrict buffer OutputBuffer { float uOut[]; };
+
+uniform int uDirectionOffset;
+uniform int uDirectionCount; // one past the last direction of this dispatch
+uniform int uSlices;
+
+void main() {
+    uint local = gl_GlobalInvocationID.x;
+    uint d = uint(uDirectionOffset) + local;
+    if (d >= uint(uDirectionCount)) return;
+    vec3 r = uDirections[d].xyz;
+    vec3 Nr = vec3(0.0), Ni = vec3(0.0), Lr = vec3(0.0), Li = vec3(0.0);
+    float P = 0.0;
+    for (int s = 0; s < uSlices; ++s) {
+        uint o = 4u * (local * uint(uSlices) + uint(s));
+        vec4 a = uPartials[o];
+        Nr += a.xyz;
+        P  += a.w;
+        Ni += uPartials[o + 1u].xyz;
+        Lr += uPartials[o + 2u].xyz;
+        Li += uPartials[o + 3u].xyz;
+    }
+    vec3 Fr = (Nr - dot(Nr, r) * r) - cross(r, Lr);
+    vec3 Fi = (Ni - dot(Ni, r) * r) - cross(r, Li);
+    uOut[2u * d]      = dot(Fr, Fr) + dot(Fi, Fi);
+    uOut[2u * d + 1u] = 0.5 * P;
+}

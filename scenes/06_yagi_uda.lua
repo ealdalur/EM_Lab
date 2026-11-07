@@ -41,4 +41,4 @@ probe     { position = c + vec(50, 0, 0), name = "forward" }
 probe     { position = c - vec(30, 0, 0), name = "backward" }
 far_field {}
 
-view { gain = 60, distance = 2.6, yaw = -60, pitch = 35 }
+view { gain = 48, distance = 2.6, yaw = -60, pitch = 35, steps_per_frame = 1  }

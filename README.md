@@ -81,8 +81,8 @@ The full reference, covering units, every key, the material table, accuracy guid
 | 12 | Monopole: ground plane vs counterpoise | ground `G` | Plates, horizontal / drooping radials, dipole reference: feed impedance (35 Ω on a 4λ plate), beam tilt |
 | 13 | Antenna matching: length vs VSWR | length `, .`; dipole / monopole `G`; 50 / 75 Ω line `I` | Detune a resonant antenna and watch VSWR rise and radiated power fall (97% → 25% accepted two steps short) |
 | 14 | Microstrip patch antenna | sweep / CW `T`; feed inset `, .`; length trim `; '`; substrate `X` | Probe-fed patch on RT5880 / FR4 / foam: S11 sweep and bandwidth, inset matching (R falls from 186 to 39 Ω as the probe moves in), where the transmission-line design model is off by 8%, 7.8 dBi broadside beam, FR4 loss (80% efficiency) |
-| 15 | 8×8 patch phased array (X band) | scan θ `, .`; scan plane φ `; '`; taper `G`; spacing `I`; size `U` | 64 probe-fed patches with their own feeds: 23.4 dBi, 12.4° beam; electronic steering in any direction; active (scan) impedance of every element; sidelobe tapers; grating lobes at wide spacing |
-| 16 | Phased-array radar | target `G`; range `, .`; azimuth `; '`; elevation `/ \`; transmitter `T`; noise `X`; separation `I`; taper `Y` | The array as a pulsed radar: clutter calibration, pulse compression, digital beamforming; detects a sphere, plate, tilted plate (stealth shaping), two spheres (angular resolution) or a missile-like cylinder to within ~1 mm in range and 1° in angle |
+| 15 | 4×4 / 8×8 patch phased array (X band) | beam azimuth `, .`; elevation `; '`; taper `G`; spacing `I`; size `U` | 64 probe-fed patches with their own feeds: 23.4 dBi, 12.4° beam; electronic steering in any direction; active (scan) impedance of every element; sidelobe tapers; grating lobes at wide spacing |
+| 16 | Phased-array radar | target `G`; range `, .`; azimuth `; '`; elevation `/ \`; scene depth `U` (5–30 λ); transmitter `T`; noise `X`; separation `I`; taper `Y` | The array as a pulsed radar: clutter calibration, pulse compression, digital beamforming; detects a sphere, plate, tilted plate (stealth shaping), two spheres (angular resolution) or a missile-like cylinder to within ~1 mm in range and 1° in angle |
 
 ## Controls
 
@@ -101,7 +101,7 @@ The full reference, covering units, every key, the material table, accuracy guid
 **View**
 - **M** cycles render modes: E+B, \|E\|, \|B\|, Poynting, and signed E. **V** picks the component for signed mode.
 - **− / +** adjust visual gain; **K / L** move the z cutaway.
-- **O** toggles the overlay; **H** toggles half-resolution rendering; **F3 / F4** change the ray step.
+- **O** toggles the overlay; **F3 / F4** change the ray step. The field volume is rendered below the window resolution on large windows (half above ~1.5 megapixels, three-quarters above 0.8), which is invisible because the glow is smooth, while lines and panels stay sharp; **H** switches between full and half resolution.
 
 **Measurement**
 - **Tab** selects a probe; the arrows and PgUp/PgDn move it (Shift for ×5).
@@ -180,8 +180,8 @@ external/glad         GLAD 0.1.36 loader, OpenGL 4.6 Core (generated)
 - **Frequency sweeps.** Pulsed excitation; the GPU records each port's V and I every step, and a double-precision DFT on the CPU gives Z(f) = V(f)/I(f) at up to 2001 frequencies, with the half-step offset between V and I compensated.
 - **Sheets.** A zero-thickness conductor is a set of perfectly conducting E edges in one lattice plane (sub-cell overrides applied after material averaging), so a foil lies exactly on a dielectric's surface.
 - **Source pass.** Source currents enter the E update additively (E ← C_a E + C_b (∇×B − J)), so they are applied by a separate pass over only the cells a source reaches (per-cell source lists built when the sources change). The cost no longer grows with the number of sources times the grid size: a 64-element array runs 2.7× faster.
-- **Radar.** A calibration run without the targets is subtracted from the run with them (clutter cancellation). Pulse compression uses a measured two-way template T = REF² / S: the boresight reference field of the calibration run, with the transmit array's near-field factor divided out, squared and divided by the drive spectrum. Back-projection then sums the 64 compressed echoes coherently at each image point's exact round-trip delay, which focuses in the near field too.
-- **Far field.** A running single-frequency DFT of E and H on a closed Huygens box (two cascaded averages, about 0.2% ripple), trapezoid-weighted surface integration, and radiation integrals evaluated on the GPU in one workgroup per direction. D = 4πU / P_rad, with P_rad taken from the same surface.
+- **Radar.** A calibration run without the targets is subtracted from the run with them (clutter cancellation). Pulse compression uses a measured two-way template T = REF² / S: the boresight reference field of the calibration run, with the transmit array's near-field factor divided out, squared and divided by the drive spectrum. Back-projection then sums the 64 compressed echoes coherently at each image point's exact round-trip delay, which focuses in the near field too. The listening window is set from the antennas' measured ring-down. The image is processed progressively on a background thread, and the part of it whose echoes have fully arrived is marked final.
+- **Far field.** A running single-frequency DFT of E and H on a closed Huygens box (two cascaded averages, about 0.2% ripple), trapezoid-weighted surface integration, and radiation integrals evaluated on the GPU: each workgroup handles 128 directions and streams the box surface through shared memory, and interactive updates are spread over a few frames (no stall). D = 4πU / P_rad, with P_rad taken from the same surface.
 
 ### Validation (measured with this code)
 
@@ -200,6 +200,7 @@ external/glad         GLAD 0.1.36 loader, OpenGL 4.6 Core (generated)
 | 8×8 patch array at broadside (0.5λ spacing) | 23.4 dBi, HPBW 12.3° | 23.0 dBi (4πA/λ²), 12.7° |
 | Same array steered to θ = 30°, φ = 45° | peak at θ 30°, φ 45°, 22.7 dBi | scan loss 10 log cos 30° = −0.6 dB |
 | Radar range accuracy (sphere / plate / cylinder, 2×2 transmitter) | −0.3 / +1.3 / 0.0 mm | true nearest surface; λ = 30 mm |
+| Radar at long range (plate, 20 λ deep scene) | −2.2 mm at 15 λ, −4.8 mm at 10 λ; multipath ghost (array ↔ plate) at twice the range, −24 dB | true front surface |
 | Radar angular resolution (two spheres, Hamming receive taper) | resolved at 30°, merged at 20° | beamwidth ≈ 19° |
 | Faraday cage (pitch λ/9) | interior \|E\| −56 dB, power −76 dB | — |
 | Wire grid, period λ/6 | E ∥ −24 dB, E ⊥ −0.1 dB | — |

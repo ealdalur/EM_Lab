@@ -26,8 +26,10 @@
 
 #include <glm/glm.hpp>
 
+#include <chrono>
 #include <complex>
 #include <filesystem>
+#include <future>
 #include <optional>
 #include <string>
 #include <vector>
@@ -69,6 +71,11 @@ struct RadarDetection {
 
 struct RadarImage {
     bool valid = false;
+    // Progressive processing: echoes from ranges up to completeRange have fully arrived, so that
+    // part of the image is final; beyond it the image is still filling in. complete = whole image.
+    bool complete = false;
+    float completeRange = 0.0f;       // cells from the transmit centre
+    double recordedTime = 0.0;        // time covered by the record (time units = cells)
     int nr = 0, naz = 0, nel = 0;
     float r0 = 0.0f, dr = 1.0f;       // range bins (cells)
     float az0 = 0.0f, daz = 1.0f;     // degrees
@@ -104,6 +111,11 @@ public:
     [[nodiscard]] Phase phase() const noexcept { return m_phase; }
     [[nodiscard]] double progress() const noexcept;
     [[nodiscard]] size_t recordSteps() const noexcept { return m_steps; }
+    [[nodiscard]] size_t recordedSteps() const noexcept { return m_recorder.recordedSteps(); }
+    // Listening window: fixed from the antennas' measured ring-down during calibration.
+    [[nodiscard]] bool windowMeasured() const noexcept { return m_windowMeasured; }
+    [[nodiscard]] double responseLength() const noexcept { return m_templateEnd; } // two-way, time units
+    [[nodiscard]] bool processing() const noexcept { return m_job.valid(); }
 
     void accumulate(const SimulationGrid& grid);        // after every completed step
     [[nodiscard]] bool calibrationComplete() const noexcept;
@@ -128,7 +140,16 @@ public:
 private:
     void startRecording(const SimulationGrid& grid);
     void readSeries(std::vector<float>& out) const; // V per [step][channel]
-    void process();
+    void measureWindow();                           // during calibration: listening window from the ring-down
+    void buildTemplate();                           // after calibration: pulse-compression filter
+    void buildTemplateSpectrum(const std::vector<float>& rec, size_t n, size_t F,
+                               std::vector<std::complex<double>>& templ) const;
+    [[nodiscard]] double responseLength(const std::vector<std::complex<double>>& templ) const;
+    [[nodiscard]] int referenceChannel(const std::vector<float>& rec, size_t n) const;
+    [[nodiscard]] double fidelityLevel() const;     // relative amplitude below which echo tails are dropped
+    [[nodiscard]] RadarImage computeImage(const std::vector<float>& meas, size_t nMeas, bool final) const;
+    void launch(bool final);                        // background processing of m_meas
+    void waitJob();
     void writeLog() const;
     // Transmit delay to a point: the group delay at the carrier of the near-field array factor
     // A(w) = sum_j (a_j / d_j) exp(-j w d_j) of the transmitting elements. In the near field of a
@@ -150,6 +171,7 @@ private:
     float m_referenceDistance = 0.0f;
     float m_wavelength = 16.0f;
     float m_cellSize = 1e-3f;
+    glm::vec3 m_interiorMin{0.0f}, m_interiorMax{0.0f}; // simulated volume inside the absorbing layer
     double m_dt = 0.5;
     double m_txTime = 0.0;               // drive-weighted centre of the transmitted pulses
     double m_pulseWidth = 8.0;           // 1/e half-width of the pulse envelope (time units)
@@ -163,5 +185,21 @@ private:
     std::vector<double> m_txAmp;
     double m_txWeight = 1.0;
     std::vector<double> m_drive;         // transmitted drive waveform, for the pulse-compression template
+    // Listening window and pulse compression (built from the calibration).
+    double m_pulseEnd = 0.0;             // end of the transmitted pulse (time units)
+    double m_extent = 0.0;               // largest element distance from the transmit centre
+    size_t m_provisionalSteps = 0;       // window before the ring-down is measured
+    size_t m_calSteps = 0;               // length of the stored calibration
+    bool m_windowMeasured = false;
+    size_t m_lastWindowCheck = 0;
+    size_t m_fftSize = 0;
+    std::vector<std::complex<double>> m_filter; // conj(template) x band window
+    double m_peakTx = 0.0;
+    float m_systemDelay = 0.0f;
+    double m_templateEnd = 0.0;          // two-way response length (time units)
+    // Background processing.
+    std::future<RadarImage> m_job;
+    bool m_jobFinal = false;
+    std::chrono::steady_clock::time_point m_lastPartial{};
     RadarImage m_image;
 };

@@ -23,6 +23,7 @@ uniform int   uAxis;       // plane normal axis: 0 = x, 1 = y, 2 = z
 uniform int   uPlaneIndex; // lattice index of the plane along uAxis
 uniform ivec2 uRectMin;    // first cell along the two tangential axes (u, v)
 uniform ivec2 uRectSize;   // number of cells along (u, v)
+uniform int   uPartialOffset; // first slot of this plane's partial sums (several planes share the buffer)
 
 shared float sPartial[256];
 
@@ -57,6 +58,6 @@ void main() {
 
     if (lid == 0u) {
         uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
-        uPartials[group] = sPartial[0];
+        uPartials[uPartialOffset + int(group)] = sPartial[0];
     }
 }

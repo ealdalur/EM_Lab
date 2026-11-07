@@ -28,4 +28,4 @@ print(string.format("ball lens: n = %.3f, paraxial focus %.1f cells behind the c
 probe      { position = c:with("x", fx), name = "focus" }
 flux_plane { axis = "x", position = fx, min = {c.y - 6, c.z - 6}, max = {c.y + 6, c.z + 6}, name = "focal spot" }
 
-view { gain = 0.8, distance = 3.0, yaw = -55, pitch = 30 }
+view { gain = 1.0, distance = 3.0, yaw = -55, pitch = 30, steps_per_frame = 1  }

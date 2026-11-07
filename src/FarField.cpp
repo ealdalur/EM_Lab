@@ -57,10 +57,18 @@ void analyseCut(PatternCut& cut) {
 FarFieldMonitor::FarFieldMonitor(const fs::path& shaderDir)
     : m_accumulate(Shader::computeFromFile(shaderDir / "ntff_accumulate.comp")),
       m_patternShader(Shader::computeFromFile(shaderDir / "ntff_pattern.comp")),
+      m_reduceShader(Shader::computeFromFile(shaderDir / "ntff_reduce.comp")),
+      m_partials(gl::createBuffer()),
       m_phasors(gl::createBuffer()),
       m_directions(gl::createBuffer()),
       m_output(gl::createBuffer()) {
-    // Direction set: three principal cuts followed by a coarse full-sphere grid.
+    buildDirections(glm::vec3(0.0f, 0.0f, 1.0f));
+}
+
+void FarFieldMonitor::buildDirections(const glm::vec3& axis) {
+    m_dirs.clear();
+    m_pattern = FarFieldPattern{};
+    // Direction set: three principal cuts followed by the two beam maps.
     const struct { const char* name; glm::vec3 a, b; } cuts[3] = {
         {"xy", {1, 0, 0}, {0, 1, 0}},  // azimuth plane (z = 0), angle from +x toward +y
         {"xz", {1, 0, 0}, {0, 0, 1}},  // elevation plane through x, angle from +x toward +z
@@ -79,8 +87,20 @@ FarFieldMonitor::FarFieldMonitor(const fs::path& shaderDir)
         }
         m_pattern.cuts.push_back(std::move(cut));
     }
-    // Beam maps: a regular grid in direction cosines (u, v) for each hemisphere. Cells outside
-    // the unit circle are not directions and are skipped (index -1).
+
+    // Beam maps: a regular grid in direction cosines (u, v) for the hemisphere around the axis
+    // and the one behind it, as seen from behind the antenna looking out along the axis: u to
+    // the right, v up (for +x: u toward -y, v toward +z). Cells outside the unit circle are not
+    // directions.
+    int ax = 2;
+    for (int i = 0; i < 3; ++i)
+        if (std::abs(axis[i]) > std::abs(axis[ax])) ax = i;
+    glm::vec3 n(0.0f), eu(0.0f), ev(0.0f);
+    n[ax] = axis[ax] >= 0.0f ? 1.0f : -1.0f;
+    boresightFrame(n, eu, ev); // u to the right, v up, as seen from behind the antenna
+    m_mapNormal = n;
+    m_mapU = eu;
+    m_mapV = ev;
     m_sphereBegin = static_cast<int>(m_dirs.size());
     m_mapIndex.assign(2 * kMapSize * kMapSize, -1);
     for (int h = 0; h < 2; ++h)
@@ -92,13 +112,15 @@ FarFieldMonitor::FarFieldMonitor(const fs::path& shaderDir)
                 if (rho2 > 1.0f) continue;
                 const float w = std::sqrt(std::max(1.0f - rho2, 0.0f));
                 m_mapIndex[static_cast<size_t>((h * kMapSize + r) * kMapSize + c)] = static_cast<int>(m_dirs.size());
-                m_dirs.emplace_back(u, v, h == 0 ? w : -w, 0.0f);
+                m_dirs.emplace_back(u * eu + v * ev + (h == 0 ? w : -w) * n, 0.0f);
             }
 
     // Immutable: written once here, then only read by the pattern shader.
+    m_directions = gl::createBuffer();
+    m_output = gl::createBuffer();
     glNamedBufferStorage(m_directions.get(), static_cast<GLsizeiptr>(m_dirs.size() * sizeof(glm::vec4)), m_dirs.data(), 0);
     glNamedBufferData(m_output.get(), static_cast<GLsizeiptr>(m_dirs.size() * 2 * sizeof(float)), nullptr,
-                      GL_DYNAMIC_READ);
+                      GL_DYNAMIC_COPY);
 }
 
 void FarFieldMonitor::configure(const SimulationGrid& grid, const FarFieldSetup& setup) {
@@ -111,7 +133,9 @@ void FarFieldMonitor::configure(const SimulationGrid& grid, const FarFieldSetup&
     s.boxMax = glm::clamp(glm::max(setup.boxMin, setup.boxMax), lo, hi);
     if (glm::any(glm::lessThan(s.boxMax - s.boxMin, glm::ivec3(4))))
         throw std::runtime_error("far_field box is degenerate after clamping to the region inside the absorbing layer");
+    cancelEvaluation();
     s.wavelength = std::max(s.wavelength, 2.0f);
+    if (glm::length(s.mapAxis - m_mapNormal) > 1e-3f || m_dirs.empty()) buildDirections(s.mapAxis);
     s.averagingPeriods = std::max(s.averagingPeriods, 0.5f);
 
     m_faceOffset[0] = 0;
@@ -135,6 +159,16 @@ void FarFieldMonitor::configure(const SimulationGrid& grid, const FarFieldSetup&
     m_patternShader.set("uPointCount", m_pointCount);
     m_patternShader.set("uK", static_cast<float>(glm::two_pi<double>() / s.wavelength));
     m_patternShader.set("uCenter", 0.5f * glm::vec3(s.boxMin + s.boxMax));
+    // Split the surface into slices of ~4096 points so even a small chunk of directions fills
+    // the GPU (one workgroup per 128 directions x slice).
+    m_slices = std::clamp((m_pointCount + 4095) / 4096, 1, 64);
+    m_patternShader.set("uSlices", m_slices);
+    m_reduceShader.set("uSlices", m_slices);
+    const size_t need = static_cast<size_t>(chunkDirections()) * static_cast<size_t>(m_slices) * 4;
+    if (need > m_partialCapacity) {
+        m_partialCapacity = need;
+        glNamedBufferData(m_partials.get(), static_cast<GLsizeiptr>(need * sizeof(glm::vec4)), nullptr, GL_DYNAMIC_COPY);
+    }
     resetAccumulation();
     m_startTime = grid.time();
 }
@@ -146,6 +180,7 @@ void FarFieldMonitor::uploadBoxUniforms(const Shader& s) const {
 }
 
 void FarFieldMonitor::disable() {
+    cancelEvaluation();
     m_enabled = false;
     m_pattern.valid = false;
 }
@@ -181,24 +216,86 @@ void FarFieldMonitor::accumulate(const SimulationGrid& grid) {
     glDispatchCompute(gl::divUp(static_cast<GLuint>(m_pointCount), kLocal), 1, 1);
 }
 
-const FarFieldPattern& FarFieldMonitor::evaluate(const SimulationGrid& /*grid*/) {
-    if (!m_enabled) return m_pattern;
+// Directions per dispatch from a fixed work budget (directions x surface points): a big
+// Huygens box spreads its evaluation over more frames instead of making each one slow.
+int FarFieldMonitor::chunkDirections() const {
+    return std::clamp(static_cast<int>(1.5e8 / std::max(m_pointCount, 1)) / 128 * 128, 128, 4096);
+}
 
+// One chunk of directions: partial radiation vectors per surface slice, then their sum.
+void FarFieldMonitor::dispatchDirections(int first, int count) {
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     m_patternShader.use();
+    m_patternShader.set("uDirectionOffset", first);
+    m_patternShader.set("uDirectionCount", first + count);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_phasors.get());
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_directions.get());
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_output.get());
-    glDispatchCompute(static_cast<GLuint>(m_dirs.size()), 1, 1);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_partials.get());
+    glDispatchCompute(gl::divUp(static_cast<GLuint>(count), 128u), static_cast<GLuint>(m_slices), 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    m_reduceShader.use();
+    m_reduceShader.set("uDirectionOffset", first);
+    m_reduceShader.set("uDirectionCount", first + count);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_directions.get());
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_partials.get());
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_output.get());
+    glDispatchCompute(gl::divUp(static_cast<GLuint>(count), 64u), 1, 1);
+}
+
+void FarFieldMonitor::cancelEvaluation() {
+    if (m_fence) glDeleteSync(m_fence);
+    m_fence = nullptr;
+    m_chunkNext = -1;
+}
+
+void FarFieldMonitor::beginEvaluation() {
+    if (!m_enabled || evaluating()) return;
+    m_chunkNext = 0;
+}
+
+void FarFieldMonitor::advanceEvaluation() {
+    if (!evaluating()) return;
+    const int kChunk = chunkDirections(); // about 0.15 G point-direction pairs: a few ms per frame
+    const int total = static_cast<int>(m_dirs.size());
+    if (m_chunkNext < total) {
+        const int count = std::min(kChunk, total - m_chunkNext);
+        dispatchDirections(m_chunkNext, count);
+        m_chunkNext += count;
+        if (m_chunkNext >= total) {
+            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+            m_readback.copyFrom(m_output.get(), m_dirs.size() * 2 * sizeof(float));
+            m_fence = gl::readbackFence();
+        }
+        return;
+    }
+    const GLenum state = glClientWaitSync(m_fence, 0, 0);
+    if (state != GL_ALREADY_SIGNALED && state != GL_CONDITION_SATISFIED) return; // not finished yet
+    cancelEvaluation();
+    const auto* mapped = static_cast<const float*>(m_readback.data());
+    finishEvaluation(std::vector<float>(mapped, mapped + m_dirs.size() * 2));
+}
+
+const FarFieldPattern& FarFieldMonitor::evaluate(const SimulationGrid& /*grid*/) {
+    if (!m_enabled) return m_pattern;
+    cancelEvaluation();
+    const int total = static_cast<int>(m_dirs.size());
+    for (int first = 0; first < total; first += chunkDirections())
+        dispatchDirections(first, std::min(chunkDirections(), total - first));
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    m_readback.copyFrom(m_output.get(), m_dirs.size() * 2 * sizeof(float));
+    GLsync fence = gl::readbackFence();
+    glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, GLuint64(5'000'000'000));
+    glDeleteSync(fence);
+    const auto* mapped = static_cast<const float*>(m_readback.data());
+    finishEvaluation(std::vector<float>(mapped, mapped + m_dirs.size() * 2));
+    return m_pattern;
+}
 
-    std::vector<float> out(m_dirs.size() * 2);
-    glGetNamedBufferSubData(m_output.get(), 0, static_cast<GLsizeiptr>(out.size() * sizeof(float)), out.data());
-
+void FarFieldMonitor::finishEvaluation(const std::vector<float>& out) {
     const double P = out[1];
     m_pattern.radiatedPower = P;
     m_pattern.valid = std::isfinite(P) && P > 1e-12;
-    if (!m_pattern.valid) return m_pattern;
+    if (!m_pattern.valid) return;
 
     // D = 4 pi U / P with U = k^2 |F|^2 / (32 pi^2)  ->  D = k^2 |F|^2 / (8 pi P)
     const double k = glm::two_pi<double>() / m_setup.wavelength;
@@ -216,6 +313,9 @@ const FarFieldPattern& FarFieldMonitor::evaluate(const SimulationGrid& /*grid*/)
     m_pattern.maxDirectivityDbi = toDbi(best);
 
     m_pattern.mapSize = kMapSize;
+    m_pattern.mapNormal = m_mapNormal;
+    m_pattern.mapU = m_mapU;
+    m_pattern.mapV = m_mapV;
     m_pattern.mapUpperDbi.assign(static_cast<size_t>(kMapSize * kMapSize), -120.0f);
     m_pattern.mapLowerDbi.assign(static_cast<size_t>(kMapSize * kMapSize), -120.0f);
     for (size_t i = 0; i < m_mapIndex.size(); ++i) {
@@ -232,7 +332,6 @@ const FarFieldPattern& FarFieldMonitor::evaluate(const SimulationGrid& /*grid*/)
         analyseCut(cut);
     }
     if (!m_setup.logPath.empty()) writeCsv(m_setup.logPath);
-    return m_pattern;
 }
 
 bool FarFieldMonitor::writeCsv(const fs::path& path) const {

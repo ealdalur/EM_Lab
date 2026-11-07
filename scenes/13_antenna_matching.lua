@@ -65,4 +65,4 @@ probe    { position = c + vec(40, 0, 0), name = "broadside" }
 flux_box { center = c, size = 100, name = "radiated power" }
 far_field {}
 
-view { gain = 70, distance = 2.4, yaw = -60, pitch = 20, steps_per_frame = 8 }
+view { gain = 45, distance = 2.4, yaw = -60, pitch = 20, steps_per_frame = 8, steps_per_frame = 1 }

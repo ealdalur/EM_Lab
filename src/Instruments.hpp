@@ -57,8 +57,18 @@ public:
                    RadarMonitor::Start radarStart = RadarMonitor::Start::Calibrate);
 
     void onStep(const SimulationGrid& grid);            // per time step (far-field DFT)
-    void measure(const SimulationGrid& grid);           // probes + flux monitors (+ CSV rows)
-    void evaluateFarField(const SimulationGrid& grid);  // radiation pattern (+ CSV)
+    // Probes + flux monitors (+ CSV rows). Non-blocking by default: this call queues a new GPU
+    // measurement and applies the previous one once it has finished. wait = true applies the
+    // current state immediately (reports, key presses, the end of a --frames run).
+    void measure(const SimulationGrid& grid, bool wait = false);
+    void evaluateFarField(const SimulationGrid& grid);  // radiation pattern (+ CSV), immediately
+    // Interactive use: start an incremental far-field evaluation (ports are evaluated now) and
+    // advance it once per frame, so a large monitor never stalls a frame.
+    void beginFarFieldEvaluation();
+    void advanceFarFieldEvaluation() {
+        m_farField.advanceEvaluation();
+        m_ports.pollEvaluate();
+    }
     void resetHistory(const SimulationGrid& grid);      // after a field reset
 
     void printReport(const SimulationGrid& grid) const;
@@ -114,6 +124,7 @@ private:
                                            std::vector<std::string>& warnings) const;
 
     void printPorts(const SimulationGrid& grid, size_t maxLines) const;
+    void applyMeasurement(const MeasureResult& r);
     void drawReadouts(ImFont* mono, float refreshSeconds);
     void drawSweepPlot();
     void drawPatternPlot();
@@ -142,6 +153,6 @@ private:
     // Ports arranged on a regular 2-D lattice (phased arrays): element map for the UI.
     int m_arrayRows = 0, m_arrayCols = 0;
     std::vector<int> m_arrayIndex;    // row-major (row 0 = largest v), port index per element
-    char m_arrayAxes[2] = {'x', 'y'}; // lattice axes (columns, rows)
+    std::string m_arrayAxes[2] = {"+x", "+y"}; // world directions of the columns (right) and rows (up)
     int m_arrayMetric = 0;            // 0 VSWR, 1 S11 dB, 2 accepted %, 3 R, 4 X
 };

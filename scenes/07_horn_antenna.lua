@@ -53,4 +53,4 @@ monopole { base = vec(x0 - Lg + t + lambda_g / 4, cy, floor_z), orientation = "+
 probe     { position = vec(x0 + flare + 30, cy, cz), name = "boresight" }
 far_field {}
 
-view { gain = 12, distance = 2.6, yaw = -50, pitch = 30 }
+view { gain = 24, distance = 2.6, yaw = -50, pitch = 30, steps_per_frame = 1 }

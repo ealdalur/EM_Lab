@@ -74,10 +74,12 @@ set(EMLAB_SHADERS
   shaders/apply_sources.comp
   shaders/clear_fields.comp
   shaders/poynting_flux.comp
+  shaders/probe_gather.comp
   shaders/field_sampling.glsl
   shaders/ntff_common.glsl
   shaders/ntff_accumulate.comp
   shaders/ntff_pattern.comp
+  shaders/ntff_reduce.comp
   shaders/port_accumulate.comp
   shaders/fullscreen.vert
   shaders/raymarch.frag
