@@ -72,7 +72,6 @@ public:
     void resetHistory(const SimulationGrid& grid);      // after a field reset
 
     void printReport(const SimulationGrid& grid) const;
-    [[nodiscard]] std::string titleSummary() const;
     void appendOverlay(std::vector<LineVertex>& out, const glm::ivec3& gridSize) const;
     // On-screen panels (Dear ImGui): readouts from the last snapshot plus live plots.
     void takeSnapshot(const SimulationGrid& grid);

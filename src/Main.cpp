@@ -798,18 +798,14 @@ void Application::updateCamera(float dt) {
 // -----------------------------------------------------------------------------
 // Reporting
 // -----------------------------------------------------------------------------
+// Program, scene, frame rate and GPU timings, plus pause / script-error markers when they apply:
+// a fallback for when the on-screen panels are hidden. Everything else is in the panels.
 void Application::updateTitle(double fps) {
-    std::string params;
-    for (const ScriptParam& p : m_params) params += " " + p.label + "=" + p.valueString();
-    char head[256];
-    std::snprintf(head, sizeof(head), "EM_Lab | %s%s | t=%.0f | %.0f fps (sim %.2f ms, render %.2f ms) | %d steps/frame%s",
-                  m_sceneName.c_str(), m_scriptError ? " [SCRIPT ERROR - see console]" : "", m_gpu->grid.time(), fps,
-                  m_gpu->simTimer.milliseconds(), m_gpu->renderTimer.milliseconds(), m_stepsPerFrame,
-                  m_paused ? " [PAUSED]" : "");
-    std::string title = head;
-    if (!params.empty()) title += " |" + params;
-    title += m_gpu->instruments.titleSummary();
-    SDL_SetWindowTitle(m_window, title.c_str());
+    char title[384];
+    std::snprintf(title, sizeof(title), "EM_Lab | %s | %.0f fps (sim %.2f ms, render %.2f ms)%s%s", m_sceneName.c_str(), fps,
+                  m_gpu->simTimer.milliseconds(), m_gpu->renderTimer.milliseconds(), m_paused ? " [PAUSED]" : "",
+                  m_scriptError ? " [SCRIPT ERROR - see the Scene panel or console]" : "");
+    SDL_SetWindowTitle(m_window, title);
 }
 
 void Application::saveScreenshot(const std::string& path) const {

@@ -422,40 +422,6 @@ void Instruments::printReport(const SimulationGrid& grid) const {
     }
 }
 
-std::string Instruments::titleSummary() const {
-    std::string s;
-    char buf[160];
-    if (!m_probes.empty()) {
-        const Probe& p = m_probes[std::min(m_selected, m_probes.size() - 1)];
-        std::snprintf(buf, sizeof(buf), " | %s |E|=%.4f |B|=%.4f", p.setup.name.c_str(), p.sample.eMagnitude(),
-                      p.sample.bMagnitude());
-        s += buf;
-    }
-    if (!m_fluxes.empty()) {
-        std::snprintf(buf, sizeof(buf), " | <P> %s=%+.3e", m_fluxes.front().setup.surface.label.c_str(),
-                      m_fluxes.front().reading.timeAveraged);
-        s += buf;
-    }
-    if (m_ports.sweeping()) {
-        const SweepResult& sw = m_ports.sweep();
-        if (sw.valid && !sw.ports.empty()) {
-            const PortSweep& ps = sw.ports.front();
-            const double ghz = 299792458.0 / (ps.bestWavelength * m_ports.cellSize()) * 1e-9;
-            std::snprintf(buf, sizeof(buf), " | best match %.3f GHz, S11 %.1f dB", ghz, ps.points[ps.best].s11Db);
-            s += buf;
-        }
-    } else if (m_ports.enabled() && !m_ports.readings().empty() && m_ports.readings().front().valid) {
-        const PortReading& r = m_ports.readings().front();
-        std::snprintf(buf, sizeof(buf), " | Z=%.0f%+.0fj ohm VSWR %.2f", r.zOhm.real(), r.zOhm.imag(), r.vswr);
-        s += buf;
-    }
-    if (m_farField.enabled() && m_farField.pattern().valid) {
-        std::snprintf(buf, sizeof(buf), " | D_max=%.2f dBi", m_farField.pattern().maxDirectivityDbi);
-        s += buf;
-    }
-    return s;
-}
-
 void Instruments::selectNextProbe() {
     if (!m_probes.empty()) m_selected = (m_selected + 1) % m_probes.size();
 }

@@ -95,7 +95,7 @@ This must be the **first** call in the script.
 
 | Key | Default | Description |
 |---|---|---|
-| `name`, `description` | | Shown in the title bar and console. |
+| `name`, `description` | | Shown in the Scene panel and console; the name also in the window title. |
 | `size` | `{128,128,128}` | Grid cells per axis. GPU memory is 48 bytes per cell. |
 | `wavelength` / `frequency` | 16 cells | Reference wavelength (see §2). |
 | `cell_size` | `1e-3` | Metres per cell. |
@@ -147,7 +147,7 @@ local taper  = param { name = "taper", choices = {"uniform", "hann"}, key = "t" 
 | `min`, `max`, `step`, `wrap` | numeric range. `wrap = true` wraps around at the ends. |
 | `keys = {dec, inc}` / `key` | key binding for numbers / for booleans and choices |
 
-Parameters may use these keys: `B F G I J T U X Y Z , . ; ' / \ `` ` ``. All other keys belong to the application. Current values appear in the Scene panel (where they can also be changed) and in the title bar.
+Parameters may use these keys: `B F G I J T U X Y Z , . ; ' / \ `` ` ``. All other keys belong to the application. Current values appear in the Scene panel, where they can also be changed.
 
 ---
 
@@ -344,7 +344,6 @@ How it works: every time step the GPU records each port's gap voltage and curren
 What you see:
 - **Plot.** The **Frequency sweep** window has three tabs: S11 (dB), VSWR and impedance (R and X) against frequency in GHz. It marks the −10 dB line, the source (design) frequency, the −10 dB band edges and the best match (frequency, S11, VSWR, Z). It shows up to four ports.
 - **Readouts.** The **Instruments** window lists, for each port, the best match (frequency, S11, VSWR, Z) and the −10 dB bandwidth (VSWR < 1.92). The single-frequency port readings are hidden; with a pulse they would be meaningless. **P** prints the same to the console.
-- **Title bar.** It shows the best match.
 
 ```
 sweep: 9600 steps recorded, ring-down 2.2e-08 of peak (settled)
@@ -363,7 +362,7 @@ Rules:
 
 ## 8. Instruments
 
-Results appear on screen in the **Instruments** window, as tables that update in place at the refresh interval (0.5 s by default; change it under View in the Scene panel). Hover over a column header for an explanation. Plots get their own windows (frequency sweep, radiation pattern, array elements, radar). **P** prints the full report to the console, and unattended `--frames` runs print it periodically. A scene without instruments shows no Instruments window. The first probe, the first flux monitor, the first antenna port (Z and VSWR, or the best match during a frequency sweep) and D_max are also shown in the title bar. Antenna feeds are ports automatically (see §7); **P** lists every port. **Tab** cycles through probes; the arrow keys and PgUp/PgDn move the selected probe. Add `log = "file.csv"` to any instrument to record data. Relative paths go in the scene's output folder.
+Results appear on screen in the **Instruments** window, as tables that update in place at the refresh interval (0.5 s by default; change it under View in the Scene panel). Hover over a column header for an explanation. Plots get their own windows (frequency sweep, radiation pattern, array elements, radar). **P** prints the full report to the console, and unattended `--frames` runs print it periodically. A scene without instruments shows no Instruments window. Antenna feeds are ports automatically (see §7); **P** lists every port. **Tab** cycles through probes; the arrow keys and PgUp/PgDn move the selected probe. Add `log = "file.csv"` to any instrument to record data. Relative paths go in the scene's output folder.
 
 | Primitive | Keys | Measures | CSV columns |
 |---|---|---|---|
