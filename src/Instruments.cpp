@@ -70,7 +70,6 @@ void Instruments::configure(const SimulationGrid& grid, const Environment& env, 
             sweep->logPath = p.string();
         }
         m_ports.configure(grid, env.ports, env.farField ? env.farField->averagingPeriods : 4.0f, sweep, env.cellSize);
-        detectArrayLayout();
         for (const PortSetup& p : env.ports)
             if (std::abs(p.wavelength - env.ports.front().wavelength) > 1e-3f) {
                 warnings.push_back("ports drive different frequencies; impedances are evaluated at the first "
@@ -94,6 +93,10 @@ void Instruments::configure(const SimulationGrid& grid, const Environment& env, 
         if (env.radar) warnings.push_back("radar: the scene has no antenna feeds to transmit and receive with");
         m_radar.disable();
     }
+
+    // Every load, including scenes without feeds: otherwise a previous scene's array layout
+    // would keep its window open.
+    detectArrayLayout();
 
     m_farField.disable();
     if (env.farField) {
