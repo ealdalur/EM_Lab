@@ -1,0 +1,48 @@
+#version 460 core
+// =============================================================================
+// line_accumulate.comp - transmission-line monitor (coax{}).
+//
+// Each quantity is a weighted sum of field samples: a line integral of E (the voltage
+// between two conductors) or a loop integral of B (the current through the loop). One
+// invocation per quantity evaluates its terms, keeps the instantaneous value, and turns it
+// into a complex amplitude at the drive frequency with the same two-stage running DFT as the
+// ports (E sampled at t, B at t - dt/2).
+// =============================================================================
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler3D uEField;
+layout(binding = 1) uniform sampler3D uBField;
+
+// x = first term, y = term count, z = 0 for an E integral, 1 for a B integral
+layout(std430, binding = 6) readonly restrict buffer QuantityBuffer { ivec4 uQuantities[]; };
+// xyz = texel, w = component (0-2: E x/y/z, 3-5: B x/y/z)
+layout(std430, binding = 7) readonly restrict buffer TermBuffer { ivec4 uTerms[]; };
+layout(std430, binding = 8) readonly restrict buffer WeightBuffer { float uWeights[]; };
+layout(std430, binding = 9) restrict buffer PhasorBuffer { vec4 uPhasors[]; }; // (stage1 re, im, stage2 re, im)
+layout(std430, binding = 10) writeonly restrict buffer NowBuffer { float uNow[]; };
+
+uniform ivec3 uGridSize;
+uniform int   uCount;
+uniform vec4  uRotation; // (cos w t_E, sin w t_E, cos w t_H, sin w t_H)
+uniform float uBlend;
+
+void main() {
+    int q = int(gl_GlobalInvocationID.x);
+    if (q >= uCount) return;
+    ivec4 info = uQuantities[q];
+    float sum = 0.0;
+    for (int k = info.x; k < info.x + info.y; ++k) {
+        ivec4 t = uTerms[k];
+        ivec3 p = clamp(t.xyz, ivec3(0), uGridSize - 1);
+        vec4 f = t.w < 3 ? texelFetch(uEField, p, 0) : texelFetch(uBField, p, 0);
+        sum += uWeights[k] * f[t.w % 3];
+    }
+    uNow[q] = sum;
+    vec2 rot = info.z == 0 ? uRotation.xy : uRotation.zw;
+    vec2 obs = 2.0 * sum * vec2(rot.x, -rot.y);
+    vec4 ph = uPhasors[q];
+    ph.xy += uBlend * (obs - ph.xy);
+    ph.zw += uBlend * (ph.xy - ph.zw);
+    uPhasors[q] = ph;
+}

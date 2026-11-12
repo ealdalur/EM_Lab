@@ -47,6 +47,8 @@ set(EMLAB_SOURCES
   src/Ports.cpp
   src/Ui.cpp
   src/Radar.cpp
+  src/Crpa.cpp
+  src/Coax.cpp
   src/InstrumentsUi.cpp
 )
 
@@ -65,6 +67,8 @@ set(EMLAB_HEADERS
   src/Ports.hpp
   src/Ui.hpp
   src/Radar.hpp
+  src/Crpa.hpp
+  src/Coax.hpp
 )
 
 set(EMLAB_SHADERS
@@ -81,6 +85,7 @@ set(EMLAB_SHADERS
   shaders/ntff_pattern.comp
   shaders/ntff_reduce.comp
   shaders/port_accumulate.comp
+  shaders/line_accumulate.comp
   shaders/fullscreen.vert
   shaders/raymarch.frag
   shaders/lines.vert

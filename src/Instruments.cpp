@@ -14,7 +14,7 @@ constexpr double kEta0 = 376.730313668;
 } // namespace
 
 Instruments::Instruments(const fs::path& shaderDir)
-    : m_analyzer(shaderDir), m_farField(shaderDir), m_ports(shaderDir), m_radar(shaderDir) {}
+    : m_analyzer(shaderDir), m_farField(shaderDir), m_ports(shaderDir), m_radar(shaderDir), m_crpa(shaderDir), m_coax(shaderDir) {}
 
 std::unique_ptr<std::ofstream> Instruments::openLog(const std::string& path, const char* header,
                                                     std::vector<std::string>& warnings) const {
@@ -94,6 +94,24 @@ void Instruments::configure(const SimulationGrid& grid, const Environment& env, 
         m_radar.disable();
     }
 
+    if (env.crpa && !env.ports.empty()) {
+        CrpaSetup c = *env.crpa;
+        if (!c.logPath.empty()) {
+            fs::path p(c.logPath);
+            if (p.is_relative()) p = m_outputDir / p;
+            std::error_code ec;
+            if (p.has_parent_path()) fs::create_directories(p.parent_path(), ec);
+            c.logPath = p.string();
+        }
+        m_crpa.configure(grid, c, env.emitters, env.sources, env.ports, env.ports.front().wavelength, env.cellSize,
+                         m_sceneKept, warnings);
+    } else {
+        m_crpa.disable();
+    }
+
+    if (!env.coaxes.empty()) m_coax.configure(grid, env.coaxes);
+    else m_coax.disable();
+
     // Every load, including scenes without feeds: otherwise a previous scene's array layout
     // would keep its window open.
     detectArrayLayout();
@@ -172,6 +190,8 @@ void Instruments::onStep(const SimulationGrid& grid) {
     m_farField.accumulate(grid);
     m_ports.accumulate(grid);
     m_radar.accumulate(grid);
+    m_crpa.accumulate(grid);
+    m_coax.accumulate(grid);
 }
 
 void Instruments::evaluatePorts() { m_ports.evaluate(); }
@@ -191,6 +211,8 @@ void Instruments::resetHistory(const SimulationGrid& grid) {
                           m_ports.cellSize());
     }
     m_radar.restart(grid);
+    m_crpa.restart(grid);
+    if (m_coax.enabled()) m_coax.restart(grid);
     m_unstable = false;
 }
 
@@ -277,7 +299,7 @@ void Instruments::printPorts(const SimulationGrid& grid, size_t maxLines) const 
     }
     // A frequency sweep drives the ports with a pulse: the single-frequency (continuous-wave)
     // readings are meaningless then, so only the sweep summary below is reported.
-    const size_t cwLines = (m_ports.sweeping() || m_radar.enabled()) ? 0 : maxLines;
+    const size_t cwLines = (m_ports.sweeping() || m_radar.enabled() || m_crpa.enabled()) ? 0 : maxLines;
     if (periods < 12.0 && cwLines > 0)
         std::printf("    ports: averaging (%.0f of ~12 periods), impedances still settling\n", periods);
     for (size_t i = 0; i < ports.size() && i < cwLines; ++i) {
@@ -341,6 +363,52 @@ void Instruments::printPorts(const SimulationGrid& grid, size_t maxLines) const 
     }
 }
 
+void Instruments::printCrpa() const {
+    if (!m_crpa.enabled()) return;
+    if (m_crpa.phase() == CrpaMonitor::Phase::Measuring) {
+        const auto& em = m_crpa.emitters();
+        const int p = m_crpa.pass();
+        std::printf("    crpa: measuring %s at the array (pass %d of %zu, %.0f%%)\n",
+                    p < static_cast<int>(em.size()) ? em[static_cast<size_t>(p)].name.c_str() : "?", p + 1, em.size(),
+                    100.0 * m_crpa.passProgress());
+        return;
+    }
+    if (m_crpa.phase() == CrpaMonitor::Phase::Listening) {
+        std::printf("    crpa: listening, all %zu emitters on (%.0f%%)\n", m_crpa.emitters().size(),
+                    100.0 * m_crpa.passProgress());
+        return;
+    }
+    const CrpaResult& r = m_crpa.result();
+    if (!r.valid) return;
+    if (r.blind)
+        std::printf("    crpa: blind, covariance from %zu snapshots (%.3f us)\n", r.snapshots, r.snapshotUs);
+    std::printf("    crpa (%s weights): SINR single element %.1f dB, steering %.1f dB, applied %.1f dB\n",
+                m_crpa.setup().mvdr ? "MVDR" : "steering", r.sinrSingleDb, r.sinrSteeringDb, r.sinrMvdrDb);
+    for (const CrpaEmitterResult& e : r.emitters)
+        std::printf("      %-12s az %5.1f el %5.1f  f %+4.1f%%  in %+6.1f dB  out %+6.1f dB  (steering only %+6.1f dB)  cross-pol %+.1f dB  settled %.0f dB\n",
+                    e.name.c_str(), e.azDeg, e.elDeg, e.offsetPct, e.inputDb, e.outputDb, e.steeringOutDb, e.crossPolDb,
+                    e.settleDb);
+}
+
+void Instruments::printCoax(const SimulationGrid& grid) const {
+    if (!m_coax.enabled()) return;
+    const double periods = m_coax.periods(grid);
+    for (size_t i = 0; i < m_coax.lines().size(); ++i) {
+        const CoaxSetup& c = m_coax.lines()[i];
+        const CoaxReading& r = m_coax.readings()[i];
+        std::printf("    %s: Z0 %.1f ohm (eps_r %.2f, velocity factor %.2f), %s end, %.0f periods\n", c.name.c_str(),
+                    c.z0Ohm, c.epsilonR, 1.0 / std::sqrt(c.epsilonR), c.termination.c_str(), periods);
+        if (!r.valid) continue;
+        std::printf("      waves: Z0 measured %.1f ohm, end Gamma %.3f @ %+.0f deg (RL %.1f dB), VSWR %.2f, Z_end %.1f %+.1fj ohm\n",
+                    r.z0Measured, std::abs(r.gammaEnd), glm::degrees(std::arg(r.gammaEnd)), r.returnLossDb, r.vswr,
+                    r.zEnd.real(), r.zEnd.imag());
+        std::printf("      forward %.0f%% of available, delivered %.0f%% of forward; shield outside current %.1f dB "
+                    "vs line current; fit residual %.1e\n",
+                    100.0 * r.forwardFraction, 100.0 * (1.0 - std::norm(r.gammaEnd)), std::max(r.commonModeDb, -200.0),
+                    r.fitResidual);
+    }
+}
+
 void Instruments::printRadar() const {
     if (!m_radar.enabled()) return;
     const RadarImage& img = m_radar.image();
@@ -395,6 +463,8 @@ void Instruments::printReport(const SimulationGrid& grid) const {
 
     printPorts(grid, 4);
     printRadar();
+    printCrpa();
+    printCoax(grid);
 
     if (m_farField.enabled()) {
         const FarFieldPattern& pat = m_farField.pattern();
@@ -495,6 +565,19 @@ void Instruments::appendOverlay(std::vector<LineVertex>& out, const glm::ivec3& 
         }
     }
 
+    if (m_crpa.enabled()) {
+        const glm::vec3 c = m_crpa.arrayCenter();
+        for (size_t e = 0; e < m_crpa.emitters().size(); ++e) {
+            const EmitterSetup& em = m_crpa.emitters()[e];
+            const bool sat = em.name == m_crpa.setup().satellite;
+            const bool active = (m_crpa.phase() == CrpaMonitor::Phase::Measuring && static_cast<int>(e) == m_crpa.pass()) ||
+                                m_crpa.phase() == CrpaMonitor::Phase::Listening;
+            const glm::vec4 col = sat ? glm::vec4(0.4f, 1.0f, 0.5f, active ? 1.0f : 0.8f) : glm::vec4(1.0f, 0.3f, 0.3f, active ? 1.0f : 0.8f);
+            VolumeRenderer::appendCross(out, W(em.position), (active ? 9.0f : 6.0f) * voxel, col);
+            out.push_back({W(c), glm::vec4(col.r, col.g, col.b, 0.3f)});
+            out.push_back({W(em.position), glm::vec4(col.r, col.g, col.b, 0.3f)});
+        }
+    }
     if (m_radar.enabled()) {
         const glm::vec4 targetColor{1.0f, 0.55f, 0.2f, 0.45f}, hitColor{1.0f, 0.25f, 0.25f, 0.95f};
         for (const TargetInfo& t : m_radar.targets()) VolumeRenderer::appendBox(out, W(t.min), W(t.max), targetColor);

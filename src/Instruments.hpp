@@ -7,6 +7,8 @@
 #include "FarField.hpp"
 #include "FieldAnalyzer.hpp"
 #include "Ports.hpp"
+#include "Coax.hpp"
+#include "Crpa.hpp"
 #include "Radar.hpp"
 #include "VolumeRenderer.hpp"
 
@@ -68,6 +70,7 @@ public:
     void advanceFarFieldEvaluation() {
         m_farField.advanceEvaluation();
         m_ports.pollEvaluate();
+        m_coax.poll();
     }
     void resetHistory(const SimulationGrid& grid);      // after a field reset
 
@@ -92,11 +95,19 @@ public:
     void radarBeginMeasurement(const SimulationGrid& grid) { m_radar.beginMeasurement(grid); }
     void radarUpdate() { m_radar.update(); }
     [[nodiscard]] const RadarMonitor& radar() const noexcept { return m_radar; }
+    // CRPA: switches the active sources between its passes (call before stepping each frame).
+    [[nodiscard]] bool hasCrpa() const noexcept { return m_crpa.enabled(); }
+    void crpaUpdate(SimulationGrid& grid) { m_crpa.update(grid); }
+    // Set before configure(): true when the reload kept the geometry (fields kept).
+    void setSceneKept(bool kept) noexcept { m_sceneKept = kept; }
     // Far field and ports sample every time step.
-    [[nodiscard]] bool needsEveryStep() const noexcept { return hasFarField() || hasPorts() || hasRadar(); }
+    [[nodiscard]] bool needsEveryStep() const noexcept {
+        return hasFarField() || hasPorts() || hasRadar() || hasCrpa() || m_coax.enabled();
+    }
     // True when the scene defines no probes, flux monitors, far-field monitor or feed ports.
     [[nodiscard]] bool empty() const noexcept {
-        return m_probes.empty() && m_fluxes.empty() && !m_farField.enabled() && !m_ports.enabled() && !m_radar.enabled();
+        return m_probes.empty() && m_fluxes.empty() && !m_farField.enabled() && !m_ports.enabled() && !m_radar.enabled() &&
+               !m_crpa.enabled() && !m_coax.enabled();
     }
     // Detailed port listing for every port (the periodic report shows the first few).
     void printAllPorts(const SimulationGrid& grid) const;
@@ -129,6 +140,10 @@ private:
     void drawPatternPlot();
     void drawArrayMap(ImFont* mono);
     void drawRadar(ImFont* mono);
+    void drawCrpa(ImFont* mono);
+    void printCrpa() const;
+    void drawCoax(ImFont* mono);
+    void printCoax(const SimulationGrid& grid) const;
     void printRadar() const;
     void drawBeamMap(const FarFieldPattern& pat, bool upper);
     void drawPatternCuts(const FarFieldPattern& pat);
@@ -138,6 +153,9 @@ private:
     FarFieldMonitor m_farField;
     PortMonitor m_ports;
     RadarMonitor m_radar;
+    CrpaMonitor m_crpa;
+    CoaxMonitor m_coax;
+    bool m_sceneKept = false;
     std::vector<WireSegment> m_wires;
     std::vector<SheetRect> m_sheets;
     std::vector<Probe> m_probes;

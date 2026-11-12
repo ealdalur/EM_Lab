@@ -54,7 +54,7 @@ far_field {}
 |---|---|
 | Geometry | `box`, `sphere` / ellipsoid, `cylinder` / tube, `wall` with slits and apertures, `grating`, `cage`, `frame`, procedural `shape{ inside = function(x, y, z) ... end }`, and zero-thickness metal `sheet`s (foils, patches, board ground planes). Shapes can be rotated and hollowed. |
 | Materials | 30 built-in (metals, PEC, dielectrics, building materials, water, ground) plus custom ones defined by ε_r with σ, conductivity in S/m, or loss tangent |
-| Antennas | Real antennas: thin wires (sub-cell thin-wire model with real radius) fed by a 50 Ω resistive voltage source: `dipole`, `monopole`, `loop`, phased `array` (1-D or 2-D, steering, tapers); passive `wire` elements. Every feed is a port reporting input impedance, Γ / S11, VSWR, accepted power and radiation resistance; a pulsed `sweep` gives Z, S11 and VSWR across a band in one run, with an on-screen S11 plot and the −10 dB bandwidth. |
+| Antennas | Real antennas: thin wires (sub-cell thin-wire model with real radius) fed by a 50 Ω resistive voltage source: `dipole`, `monopole`, `loop`, phased `array` (1-D or 2-D, steering, tapers); passive `wire` elements. Every feed is a port reporting input impedance, Γ / S11, VSWR, accepted power and radiation resistance; a pulsed `sweep` gives Z, S11 and VSWR across a band in one run, with an on-screen S11 plot and the −10 dB bandwidth. `emitter{}` point transmitters (linear or circular), `crpa{}` adaptive GPS arrays (MVDR nulling), and `coax{}` cables with a standing-wave monitor and an optional sleeve balun. |
 | Sources | Illumination: `plane_wave` (one-way or two-way), `gaussian_beam`. Ideal elements for theory checks: point (Hertzian) dipole, `model = "current"`, generic `current_source`. Waveforms: CW or pulses. |
 | Instruments | `probe`, `flux_plane`, `flux_box`, `far_field` (radiation pattern, directivity in dBi, beamwidth, front/back) and `sweep` (port impedance vs frequency), each with optional CSV logging |
 | Interactivity | `param{}` binds keys to values. The script is re-run when a key is pressed, keeping the fields when only sources changed. Saving the file hot-reloads it. |
@@ -83,6 +83,8 @@ The full reference, covering units, every key, the material table, accuracy guid
 | 14 | Microstrip patch antenna | sweep / CW `T`; feed inset `, .`; length trim `; '`; substrate `X` | Probe-fed patch on RT5880 / FR4 / foam: S11 sweep and bandwidth, inset matching (R falls from 186 to 39 Ω as the probe moves in), where the transmission-line design model is off by 8%, 7.8 dBi broadside beam, FR4 loss (80% efficiency) |
 | 15 | 4×4 / 8×8 patch phased array (X band) | beam azimuth `, .`; elevation `; '`; taper `G`; spacing `I`; size `U` | 64 probe-fed patches with their own feeds: 23.4 dBi, 12.4° beam; electronic steering in any direction; active (scan) impedance of every element; sidelobe tapers; grating lobes at wide spacing |
 | 16 | Phased-array radar | target `G`; range `, .`; azimuth `; '`; elevation `/ \`; scene depth `U` (5–30 λ); transmitter `T`; noise `X`; separation `I`; taper `Y` | The array as a pulsed radar: clutter calibration, pulse compression, digital beamforming; detects a sphere, plate, tilted plate (stealth shaping), two spheres (angular resolution) or a missile-like cylinder to within ~1 mm in range and 1° in angle |
+| 17 | CRPA: adaptive GPS antenna | jammers `J`; positions `, .`; satellite azimuth `; '` and elevation `/ \`; JNR `X`; weights `T`; steering vector `Y`; adaptation `B` | 2×2 RHCP dual-probe patch array at GPS L1 with a satellite and 1–3 random jammers. Blind MVDR from I/Q snapshots of everything at once (as a real receiver), or ideal from separately measured responses: SINR +43 dB, adapted pattern shown by reciprocity |
+| 18 | Coax-fed dipole and balun | termination `T`; dipole length `, .`; balun `B` and its length `/ \`; cable impedance `I`; cable length `; '`; CW / pulse `U` | A generator, 2λ of real coax and a dipole: traveling vs standing waves along the cable (VSWR, Γ, Z at the antenna), and the current on the outside of the shield without a balun (−9 dB, beam tilted 32°) vs with a quarter-wave sleeve balun (−27 dB, beam level) |
 
 ## Controls
 
@@ -146,6 +148,8 @@ src/
   Instruments.*       Probes, flux monitors, far-field monitor: averaging, CSV logs, reports, overlay
   InstrumentsUi.cpp   On-screen instrument panels and plots (Dear ImGui / ImPlot)
   Radar.*             Pulsed radar: clutter calibration, pulse compression, back-projection imaging, detection
+  Crpa.*              Adaptive GPS array: per-emitter steering vectors, RHCP hybrid, MVDR weights, adapted pattern
+  Coax.*              Coaxial cable monitor: line integrals of E and H along the cable, two-wave fit (Gamma, VSWR, Z)
   Ui.*                Dear ImGui / ImPlot setup, DPI scaling, fonts, event routing
   FarField.*          GPU near-to-far-field transform: running DFT on a Huygens box, pattern and directivity
   FieldAnalyzer.*     Staggering-aware probe readback, GPU Poynting flux through planes / boxes
@@ -201,6 +205,8 @@ external/glad         GLAD 0.1.36 loader, OpenGL 4.6 Core (generated)
 | Same array steered to θ = 30°, φ = 45° | peak at θ 30°, φ 45°, 22.7 dBi | scan loss 10 log cos 30° = −0.6 dB |
 | Radar range accuracy (sphere / plate / cylinder, 2×2 transmitter) | −0.3 / +1.3 / 0.0 mm | true nearest surface; λ = 30 mm |
 | Radar at long range (plate, 20 λ deep scene) | −2.2 mm at 15 λ, −4.8 mm at 10 λ; multipath ghost (array ↔ plate) at twice the range, −24 dB | true front surface |
+| Coax line (`coax{}`, 50 Ω) | Z0 from the waves 50.0 Ω; short Γ = 1.000 ∠ 180°; 100 Ω load Γ = 0.338; matched load return loss 25–31 dB | Γ = 0.333 for 100 Ω |
+| CRPA nulls (2×2 RHCP array, 2 jammers at 40 dB JNR) | blind (160 snapshots): jammers 21–24 dB below noise; ideal: 40–53 dB below, real transmitted nulls 47–59 dB vs steering; both lift SINR 43 dB | N − 1 = 3 nullable jammers |
 | Radar angular resolution (two spheres, Hamming receive taper) | resolved at 30°, merged at 20° | beamwidth ≈ 19° |
 | Faraday cage (pitch λ/9) | interior \|E\| −56 dB, power −76 dB | — |
 | Wire grid, period λ/6 | E ∥ −24 dB, E ⊥ −0.1 dB | — |

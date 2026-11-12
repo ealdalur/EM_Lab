@@ -99,7 +99,7 @@ void Instruments::drawUi(const Ui& ui, float refreshSeconds) {
     ImFont* mono = ui.monoFont();
 
     // ---- readouts -------------------------------------------------------------------------
-    const bool cwPorts = m_ports.enabled() && !m_ports.sweeping() && !m_radar.enabled();
+    const bool cwPorts = m_ports.enabled() && !m_ports.sweeping() && !m_radar.enabled() && !m_crpa.enabled();
     const bool readouts = !m_probes.empty() || !m_fluxes.empty() || cwPorts || m_ports.sweeping() || m_farField.enabled();
     if (readouts) {
         const float w = 600.0f * k;
@@ -119,6 +119,25 @@ void Instruments::drawUi(const Ui& ui, float refreshSeconds) {
         ImGui::End();
     }
 
+    // ---- CRPA -------------------------------------------------------------------------------
+    if (m_crpa.enabled()) {
+        const ImVec2 size(600.0f * k, std::min(vp->WorkSize.y - 2.0f * pad, 860.0f * k));
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - size.x - pad, vp->WorkPos.y + pad), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("CRPA (adaptive GPS antenna)")) drawCrpa(mono);
+        ImGui::End();
+    }
+
+    // ---- coax cable ---------------------------------------------------------------------------
+    if (m_coax.enabled()) {
+        const ImVec2 size(std::min(760.0f * k, vp->WorkSize.x - 2.0f * pad), 470.0f * k);
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 500.0f * k, vp->WorkPos.y + vp->WorkSize.y - size.y - pad),
+                                ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Cable")) drawCoax(mono);
+        ImGui::End();
+    }
+
     // ---- radar ------------------------------------------------------------------------------
     if (m_radar.enabled()) {
         const ImVec2 size(640.0f * k, std::min(vp->WorkSize.y - 2.0f * pad, 860.0f * k));
@@ -129,7 +148,7 @@ void Instruments::drawUi(const Ui& ui, float refreshSeconds) {
     }
 
     // ---- array element map ------------------------------------------------------------------
-    if (m_arrayRows > 0 && !m_ports.sweeping() && !m_radar.enabled()) {
+    if (m_arrayRows > 0 && !m_ports.sweeping() && !m_radar.enabled() && !m_crpa.enabled()) {
         const ImVec2 size(430.0f * k, 440.0f * k);
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - size.x - pad, vp->WorkPos.y + vp->WorkSize.y - size.y - pad),
                                 ImGuiCond_FirstUseEver);
@@ -139,7 +158,10 @@ void Instruments::drawUi(const Ui& ui, float refreshSeconds) {
     }
 
     // ---- radiation pattern ------------------------------------------------------------------
-    if (m_farField.enabled() && m_farField.pattern().valid) {
+    // (A CRPA's measurement passes have transmitters inside the far-field box: only its
+    // adapted pass, where the array itself transmits, has a meaningful pattern.)
+    if (m_farField.enabled() && m_farField.pattern().valid &&
+        (!m_crpa.enabled() || m_crpa.phase() == CrpaMonitor::Phase::Adapted)) {
         const ImVec2 size(480.0f * k, 420.0f * k);
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + pad, vp->WorkPos.y + vp->WorkSize.y - size.y - pad), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
@@ -203,7 +225,7 @@ void Instruments::drawReadouts(ImFont* mono, float refreshSeconds) {
     }
 
     // Antenna ports (continuous wave)
-    if (!s.ports.empty() && !m_ports.sweeping() && !m_radar.enabled() &&
+    if (!s.ports.empty() && !m_ports.sweeping() && !m_radar.enabled() && !m_crpa.enabled() &&
         ImGui::CollapsingHeader("Antenna ports", ImGuiTreeNodeFlags_DefaultOpen)) {
         const auto& ports = m_ports.ports();
         if (s.portPeriods < 12.0)
@@ -561,6 +583,156 @@ void Instruments::drawArrayMap(ImFont* mono) {
     ImPlot::PopColormap();
 }
 
+void Instruments::drawCrpa(ImFont* mono) {
+    const CrpaMonitor& crpa = m_crpa;
+    const CrpaResult& r = crpa.result();
+    const auto& em = crpa.emitters();
+    if (crpa.phase() == CrpaMonitor::Phase::Measuring) {
+        const int p = crpa.pass();
+        ImGui::TextColored(kWarn, "Listening: measuring how %s arrives at the %zu elements (pass %d of %zu)",
+                           p < static_cast<int>(em.size()) ? em[static_cast<size_t>(p)].name.c_str() : "?",
+                           crpa.elementCount(), p + 1, em.size());
+        tooltip("Each emitter transmits alone while the array listens; the steady-state voltage at every port is that "
+                "emitter's steering vector (it includes mutual coupling, the ground plane and the near field). The "
+                "processor combines them into the covariance a receiver would measure with all of them on.");
+        ImGui::ProgressBar(static_cast<float>(crpa.passProgress()), ImVec2(-1.0f, 0.0f));
+    } else if (crpa.phase() == CrpaMonitor::Phase::Listening) {
+        ImGui::TextColored(kWarn, "Listening: all %zu emitters on at once; the receiver records its %zu channels",
+                           em.size(), crpa.elementCount());
+        tooltip("Blind adaptation, as in a real receiver: nothing is known about the jammers. After the fields settle, "
+                "every channel is mixed down to complex baseband (I/Q) and sampled; with its own thermal noise added, "
+                "the snapshots give the covariance estimate R = (1/K) sum x x^H that the MVDR weights use. The jammers "
+                "transmit a few percent off the carrier so they are independent of each other and of the satellite.");
+        ImGui::ProgressBar(static_cast<float>(crpa.passProgress()), ImVec2(-1.0f, 0.0f));
+    } else {
+        ImGui::TextColored(kGood, "Adapted: the array transmits its %s receive weights (by reciprocity: the receive pattern)",
+                           crpa.setup().mvdr ? "MVDR" : "steering-only");
+        tooltip("The fields now show the adapted pattern: a beam toward the satellite and nulls on the jammers. "
+                "Changing the jammer-to-noise ratio or the weights re-uses the measurements.");
+    }
+    if (!r.valid) return;
+
+    if (mono) ImGui::PushFont(mono, 14.0f);
+    if (r.blind) {
+        ImGui::Text("blind: covariance estimated from %zu snapshots (%.1f ns of signal)", r.snapshots, r.snapshotUs * 1e3);
+        tooltip("The weights come only from what the receiver sampled: baseband snapshots of all channels with all "
+                "emitters on, plus receiver noise. The per-emitter figures below are separated from the same recording "
+                "afterwards (each emitter at its own frequency) only to score the result.");
+    } else {
+        ImGui::Text("ideal: covariance from separately measured emitter responses");
+        tooltip("Each emitter was measured in a pass of its own and the covariance built as if they were independent: "
+                "what a receiver converges to with unlimited snapshots. Not available to a real receiver.");
+    }
+    ImGui::Text("SINR at the satellite (signal / interference + noise):");
+    ImGui::Text("  one element %+.1f dB   steering only %+.1f dB   %s %+.1f dB", r.sinrSingleDb, r.sinrSteeringDb,
+                crpa.setup().mvdr ? "MVDR" : "applied", r.sinrMvdrDb);
+    tooltip("Signal to interference-plus-noise ratio of the satellite after combining. GPS needs roughly 0 dB or "
+            "better after its 43 dB of despreading gain; jammers push it far below.");
+    if (ImGui::BeginTable("crpaEmitters", 6, kTableFlags)) {
+        headers({{"emitter", "The satellite (green) and the jammers (red) in 3D"},
+                 {"az / el", "Compass azimuth (from north, +y, clockwise) and elevation from the array centre"},
+                 {"at an element", "Power at one element relative to the receiver noise"},
+                 {"after weights", "Power after the applied weights, relative to the output noise"},
+                 {"steering only", "After plain beam steering toward the satellite (no nulling), for comparison"},
+                 {"cross-pol", "Left-hand-circular response relative to right-hand: how well the RHCP elements reject the "
+                               "emitter's polarization"}});
+        for (const CrpaEmitterResult& e : r.emitters) {
+            ImGui::TableNextRow();
+            if (r.blind && !e.satellite) cellColored(kBad, "%s (%+.1f%%)", e.name.c_str(), e.offsetPct);
+            else cellColored(e.satellite ? kGood : kBad, "%s", e.name.c_str());
+            cell("%5.1f / %4.1f", e.azDeg, e.elDeg);
+            cell("%+6.1f dB", e.inputDb);
+            if (e.satellite) cell("%+6.1f dB", e.outputDb);
+            else cellColored(e.outputDb < 0.0 ? kGood : kWarn, "%+6.1f dB", e.outputDb);
+            cell("%+6.1f dB", e.steeringOutDb);
+            cell("%+5.1f dB", e.crossPolDb);
+        }
+        ImGui::EndTable();
+    }
+    double worstSettle = -300.0;
+    for (const CrpaEmitterResult& e : r.emitters) worstSettle = std::max(worstSettle, e.settleDb);
+    ImGui::TextColored(worstSettle < (r.blind ? -20.0 : -60.0) ? kDim : kWarn,
+                       r.blind ? "separation residual %.0f dB" : "measurements settled to %.0f dB", worstSettle);
+    if (r.blind)
+        tooltip("What is left of the recording after removing every emitter's fitted tone (antennas still ringing from "
+                "turn-on), relative to the weakest emitter: how accurately the figures above are scored. Lengthen "
+                "crpa{ periods = ... } (the settling time) if it is above about -20 dB.");
+    else
+        tooltip("How much each emitter's measured response still changed over the last 4 periods of its pass. The null "
+            "depth the processor can achieve is limited to about this level; lengthen crpa{ periods = ... } if it "
+            "is above about -60 dB.");
+    if (ImGui::BeginTable("crpaWeights", static_cast<int>(r.weights.size()) + 1, kTableFlags)) {
+        ImGui::TableSetupColumn("weight");
+        for (size_t i = 0; i < r.weights.size(); ++i) {
+            char name[16];
+            std::snprintf(name, sizeof(name), "element %zu", i + 1);
+            ImGui::TableSetupColumn(name);
+        }
+        ImGui::TableHeadersRow();
+        ImGui::TableNextRow();
+        cell("|w|  phase");
+        double wmax = 0.0;
+        for (const auto& w : r.weights) wmax = std::max(wmax, std::abs(w));
+        for (const auto& w : r.weights)
+            cell("%.2f %+4.0f", std::abs(w) / std::max(wmax, 1e-30), glm::degrees(std::arg(w)));
+        ImGui::EndTable();
+    }
+    if (mono) ImGui::PopFont();
+
+    // Model sky map of the applied weights: zenith in the centre, north up, east right.
+    static int show = 0;
+    ImGui::RadioButton("applied weights", &show, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("steering only", &show, 1);
+    ImGui::SameLine();
+    ImGui::TextColored(kDim, "(?)");
+    tooltip("Array pattern predicted by the processor's model (ideal elements): a GPS sky plot with the zenith in the "
+            "centre, north up, east right; rings at elevations 60, 30 and 0 degrees. Green o: satellite, red x: "
+            "jammers. The Radiation pattern window shows the full-wave pattern of the adapted pass.");
+    const auto& map = show == 0 ? r.mapDb : r.steeringMapDb;
+    const double lo = -40.0;
+    std::vector<double> vals(map.size());
+    for (size_t i = 0; i < map.size(); ++i) vals[i] = std::max(static_cast<double>(map[i]), lo);
+    ImPlot::PushColormap(ImPlotColormap_Viridis);
+    const float scaleWidth = 70.0f;
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float side = std::max(std::min(avail.x - scaleWidth, avail.y), 120.0f);
+    if (ImPlot::BeginPlot("##sky", ImVec2(side, side), ImPlotFlags_NoLegend)) {
+        ImPlot::SetupAxes("east", "north", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_NoTickLabels);
+        ImPlot::SetupAxesLimits(-1.05, 1.05, -1.05, 1.05, ImPlotCond_Always);
+        ImPlot::PlotHeatmap("sky", vals.data(), r.mapSize, r.mapSize, lo, 0.0, nullptr, ImPlotPoint(-1, -1), ImPlotPoint(1, 1));
+        for (double elev : {60.0, 30.0, 0.0}) {
+            const double rr = std::cos(glm::radians(elev));
+            double xs[97], ys[97];
+            for (int i = 0; i <= 96; ++i) {
+                const double t = glm::two_pi<double>() * i / 96.0;
+                xs[i] = rr * std::cos(t);
+                ys[i] = rr * std::sin(t);
+            }
+            ImPlotSpec ring;
+            ring.LineColor = ImVec4(1.0f, 1.0f, 1.0f, elev == 0.0 ? 0.6f : 0.25f);
+            ring.Flags = ImPlotItemFlags_NoLegend;
+            ImPlot::PlotLine("##ring", xs, ys, 97, ring);
+        }
+        for (const CrpaEmitterResult& e : r.emitters) {
+            const double rr = std::cos(glm::radians(e.elDeg));
+            const double x = rr * std::sin(glm::radians(e.azDeg)), y = rr * std::cos(glm::radians(e.azDeg));
+            ImPlotSpec m;
+            m.Marker = e.satellite ? ImPlotMarker_Circle : ImPlotMarker_Cross;
+            m.MarkerSize = 7.0f;
+            m.MarkerFillColor = ImVec4(0, 0, 0, 0);
+            m.MarkerLineColor = e.satellite ? ImVec4(0.4f, 1.0f, 0.5f, 1.0f) : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+            m.Flags = ImPlotItemFlags_NoLegend;
+            ImPlot::PlotScatter("##em", &x, &y, 1, m);
+            ImPlot::PlotText(e.name.c_str(), x, y, ImVec2(0, -12));
+        }
+        ImPlot::EndPlot();
+    }
+    ImGui::SameLine();
+    ImPlot::ColormapScale("dB", lo, 0.0, ImVec2(scaleWidth - 8.0f, side), "%.0f");
+    ImPlot::PopColormap();
+}
+
 void Instruments::drawRadar(ImFont* mono) {
     const RadarMonitor& radar = m_radar;
     const RadarImage& img = radar.image();
@@ -847,10 +1019,12 @@ void Instruments::drawBeamMap(const FarFieldPattern& pat, bool upper) {
             if (std::abs(v[k]) > std::abs(v[i])) i = k;
         return "xyz"[i];
     };
+    auto axisSign = [](const glm::vec3& v) { return v[0] + v[1] + v[2] > 0.0f ? '+' : '-'; };
     const glm::vec3 n = upper ? pat.mapNormal : -pat.mapNormal;
     const char nc = axisChar(n), uc = axisChar(pat.mapU), vc = axisChar(pat.mapV);
-    ImGui::TextColored(kDim, "Hemisphere around %c%c: u, v = direction components along +%c, +%c; rings 30, 60, 90 deg off the %c axis.",
-                       n[0] + n[1] + n[2] > 0.0f ? '+' : '-', nc, uc, vc, nc);
+    const char us = axisSign(pat.mapU), vs = axisSign(pat.mapV);
+    ImGui::TextColored(kDim, "Hemisphere around %c%c: u, v = direction components along %c%c, %c%c; rings 30, 60, 90 deg off the %c axis.",
+                       axisSign(n), nc, us, uc, vs, vc, nc);
     const double peak = pat.maxDirectivityDbi;
     const double lo = peak - 30.0;
     std::vector<double> vals(map.size());
@@ -861,8 +1035,8 @@ void Instruments::drawBeamMap(const FarFieldPattern& pat, bool upper) {
     const float side = std::max(std::min(avail.x - scaleWidth, avail.y), 120.0f);
     if (ImPlot::BeginPlot("##beam", ImVec2(side, side), ImPlotFlags_NoLegend)) {
         char ul[24], vl[24];
-        std::snprintf(ul, sizeof(ul), "u (toward +%c)", uc);
-        std::snprintf(vl, sizeof(vl), "v (toward +%c)", vc);
+        std::snprintf(ul, sizeof(ul), "u (toward %c%c)", us, uc);
+        std::snprintf(vl, sizeof(vl), "v (toward %c%c)", vs, vc);
         ImPlot::SetupAxes(ul, vl);
         ImPlot::SetupAxesLimits(-1.05, 1.05, -1.05, 1.05, ImPlotCond_Always);
         ImPlot::PlotHeatmap("D", vals.data(), pat.mapSize, pat.mapSize, lo, peak, nullptr, ImPlotPoint(-1, -1), ImPlotPoint(1, 1));
@@ -947,5 +1121,133 @@ void Instruments::drawPatternCuts(const FarFieldPattern& pat) {
             ImPlot::PlotLine(names[c], as.data(), ds.data(), static_cast<int>(as.size()), spec);
         }
         ImPlot::EndPlot();
+    }
+}
+
+void Instruments::drawCoax(ImFont* mono) {
+    for (size_t li = 0; li < m_coax.lines().size(); ++li) {
+        const CoaxSetup& c = m_coax.lines()[li];
+        const CoaxReading& r = m_coax.readings()[li];
+        ImGui::PushID(static_cast<int>(li));
+        const double vf = 1.0 / std::sqrt(std::max(c.epsilonR, 1.0f));
+        const double lamG = r.beta > 0.0 ? glm::two_pi<double>() / r.beta : c.wavelength * vf; // cells
+        if (mono) ImGui::PushFont(mono, 14.0f);
+        ImGui::Text("%s: Z0 %.1f ohm, eps_r %.2f, velocity factor %.2f, %.2f wavelengths long (%s end)", c.name.c_str(),
+                    c.z0Ohm, c.epsilonR, vf, c.length / lamG, c.termination.c_str());
+        tooltip("Z0 comes from a 2-D electrostatic solve of the cable's cross-section on the grid; the dielectric is "
+                "chosen to give the requested impedance. In the cable, waves travel at the velocity factor times the "
+                "speed of light, so one wavelength in the cable is shorter than in air.");
+        if (c.pulsed) {
+            ImGui::TextColored(kDim, "pulse: watch it travel to the far end and back (the standing-wave analysis "
+                                     "needs waveform = \"cw\")");
+        } else if (!r.valid) {
+            ImGui::TextColored(kWarn, "waiting for the waves to settle...");
+        } else {
+            const double g = std::abs(r.gammaEnd);
+            ImGui::Text("far end: Gamma %.3f @ %+.0f deg  RL %.1f dB  VSWR %.2f  Z = %.1f %+.1fj ohm", g,
+                        glm::degrees(std::arg(r.gammaEnd)), r.returnLossDb, r.vswr, r.zEnd.real(), r.zEnd.imag());
+            tooltip("From the two waves on the line: Gamma = (backward / forward wave) at the far end of the cable, "
+                    "VSWR = (1 + |Gamma|) / (1 - |Gamma|) is the ratio of the voltage maxima to minima along it, and "
+                    "Z = Z0 (1 + Gamma) / (1 - Gamma) is the impedance terminating the cable: the antenna as the cable "
+                    "sees it, including the feed region and anything coupling onto the shield.");
+            ImGui::Text("power:   %.0f%% of the generator's available power goes forward, %.0f%% of that is delivered",
+                        100.0 * r.forwardFraction, 100.0 * (1.0 - g * g));
+            if (r.commonModeDb < -200.0)
+                ImGui::TextColored(kDim, "shield:  no current on the outside (a closed line does not radiate)");
+            else
+                ImGui::TextColored(r.commonModeDb > -15.0 ? kWarn : kDim,
+                                   "shield:  current on the outside %.1f dB vs the line current", r.commonModeDb);
+            tooltip("Peak net current on the outside of the shield (a loop round the whole cable, and round the "
+                    "balun sleeve where there is one), relative to the forward wave's current on the inner conductor. "
+                    "A balanced, well-baluned feed keeps it small; without a balun the shield becomes part of the "
+                    "antenna and radiates.");
+            ImGui::TextColored(kDim, "check:   Z0 from the waves V+/I+ = %.1f ohm, two-wave fit residual %.1e", r.z0Measured,
+                               r.fitResidual);
+        }
+        if (mono) ImGui::PopFont();
+
+        static bool showCurrent = false;
+        ImGui::Checkbox("current envelope", &showCurrent);
+        tooltip("Also plot Z0 |I| along the cable: its maxima sit at the voltage minima, a quarter wavelength apart.");
+        const size_t n = r.tV.size();
+        if (n < 2) {
+            ImGui::PopID();
+            continue;
+        }
+        const double scaleV = c.pulsed ? std::max(r.peakNow, 1e-30) : std::max(std::abs(r.A), 1e-30);
+        const double iFwd = c.pulsed ? std::max(r.peakNow / (c.z0Ohm / 376.730313668), 1e-30)
+                                     : std::max(std::abs(r.A) / (c.z0Ohm / 376.730313668), 1e-30);
+        std::vector<double> xv(n), xi(n), now(n), env(n), envN(n), cur(n), cm(n), cmNow(n);
+        double cmMax = 0.0;
+        for (size_t k = 0; k < n; ++k) {
+            xv[k] = r.tV[k] / lamG;
+            xi[k] = r.tI[k] / lamG;
+            now[k] = r.vNow[k] / scaleV;
+            env[k] = std::abs(r.V[k]) / scaleV;
+            envN[k] = -env[k];
+            cur[k] = std::abs(r.I[k]) / iFwd;
+            cm[k] = std::abs(r.Icm[k]) / iFwd;
+            cmNow[k] = r.cmNow[k] / iFwd;
+            cmMax = std::max(cmMax, c.pulsed ? std::abs(cmNow[k]) : cm[k]);
+        }
+        const double xEnd = c.length / lamG;
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float h1 = std::max(avail.y * 0.58f, 120.0f), h2 = std::max(avail.y - h1 - 8.0f, 90.0f);
+        if (ImPlot::BeginPlot("##coaxV", ImVec2(-1, h1))) {
+            ImPlot::SetupAxes("distance from the generator (wavelengths in the cable)", "voltage / forward wave");
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, xEnd, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, -2.1, 2.1, ImPlotCond_Always);
+            ImPlot::SetupLegend(ImPlotLocation_NorthWest);
+            if (!c.pulsed && r.valid) {
+                ImPlotSpec band;
+                band.FillColor = ImVec4(0.4f, 0.7f, 1.0f, 1.0f);
+                band.FillAlpha = 0.15f;
+                ImPlot::PlotShaded("|V| envelope", xv.data(), envN.data(), env.data(), static_cast<int>(n), band);
+                ImPlotSpec e;
+                e.LineColor = ImVec4(0.4f, 0.7f, 1.0f, 0.9f);
+                ImPlot::PlotLine("##env", xv.data(), env.data(), static_cast<int>(n), e);
+                if (showCurrent) {
+                    ImPlotSpec ci;
+                    ci.LineColor = ImVec4(1.0f, 0.75f, 0.3f, 0.9f);
+                    ImPlot::PlotLine("Z0 |I| envelope", xi.data(), cur.data(), static_cast<int>(n), ci);
+                }
+            }
+            ImPlotSpec live;
+            live.LineColor = ImVec4(1.0f, 1.0f, 1.0f, 0.95f);
+            live.LineWeight = 2.0f;
+            ImPlot::PlotLine("V now", xv.data(), now.data(), static_cast<int>(n), live);
+            if (c.sleeveOuter > 0) {
+                const double sl[2] = {c.sleeveStart / lamG, c.sleeveEnd / lamG};
+                ImPlotSpec s;
+                s.LineColor = ImVec4(0.9f, 0.6f, 0.3f, 0.6f);
+                ImPlot::PlotInfLines("balun sleeve", sl, 2, s);
+            }
+            ImPlot::EndPlot();
+        }
+        if (ImPlot::BeginPlot("##coaxCm", ImVec2(-1, h2))) {
+            ImPlot::SetupAxes(nullptr, "shield outside / line current");
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, xEnd, ImPlotCond_Always);
+            const double top = std::max(0.25, 1.15 * cmMax);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, c.pulsed ? -top : 0.0, top, ImPlotCond_Always);
+            ImPlot::SetupLegend(ImPlotLocation_NorthWest);
+            ImPlotSpec e;
+            e.LineColor = ImVec4(1.0f, 0.4f, 0.4f, 0.9f);
+            e.FillColor = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+            e.FillAlpha = 0.2f;
+            if (!c.pulsed && r.valid) {
+                ImPlot::PlotShaded("|I| on the outside of the shield", xi.data(), cm.data(), static_cast<int>(n), 0.0, e);
+                ImPlot::PlotLine("##cm", xi.data(), cm.data(), static_cast<int>(n), e);
+            } else {
+                ImPlot::PlotLine("I on the outside of the shield, now", xi.data(), cmNow.data(), static_cast<int>(n), e);
+            }
+            if (c.sleeveOuter > 0) {
+                const double sl[2] = {c.sleeveStart / lamG, c.sleeveEnd / lamG};
+                ImPlotSpec s;
+                s.LineColor = ImVec4(0.9f, 0.6f, 0.3f, 0.6f);
+                ImPlot::PlotInfLines("balun sleeve", sl, 2, s);
+            }
+            ImPlot::EndPlot();
+        }
+        ImGui::PopID();
     }
 }

@@ -126,6 +126,8 @@ struct SourceDesc {
     float repeatPeriods = 0.0f;  // pulse repetition interval (0 = single shot)
     float delayPeriods = 0.0f;   // start delay
     bool enabled = true;
+    int emitter = -1;            // index into Environment::emitters, if this source belongs to one
+    int port = -1;               // index into Environment::ports, if this is an antenna feed
 
     // Wire current along `axis` carrying peak current `current` (total current through the
     // cross-section). length = 0 gives a point (Hertzian) dipole, an "oscillating electron".

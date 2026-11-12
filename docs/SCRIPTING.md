@@ -114,6 +114,7 @@ Initial camera and rendering settings. Can be called anywhere in the script.
 | `exposure`, `density`, `step` | tone mapping, gas opacity, ray step in voxels |
 | `distance`, `yaw`, `pitch`, `target` | orbit camera. Angles in degrees; `target` in lattice coordinates (default: grid centre). |
 | `steps_per_frame`, `overlay` | simulation speed, overlay on/off |
+| `metal_opacity` | how opaque metal is drawn, 0–1 (default 0.45). Lower it to see fields inside metal structures such as a `coax{}`. |
 
 ### `material{}`
 Defines a named material and returns its name.
@@ -251,6 +252,7 @@ All sources share these timing keys:
 | `wire{}` | `from`, `to`, `radius=λ/400` | A passive thin conductor (reflector, director, radial) between two lattice points along x, y or z. |
 | `array{}` | `center`, `elements` (`8` or `{4,4}`), `axis` (`"y"` or `{"y","z"}`), `spacing` (default λ/2, or `{dy, dz}`), `orientation="z"`, `length` (default 0.45λ), `steer` or `phase_step`, `taper`, plus the antenna keys | Phased array of centre-fed dipoles, each with its own feed (port). `steer` (degrees from broadside toward +axis) sets phase step Δφ = −k·d·sin θ; `phase_step` sets it directly in degrees. Use `{a, b}` per axis for 2-D arrays. `taper`: `"uniform"`, `"binomial"`, `"hann"`, `"cosine"`, `"triangular"`, or a list of weights (1-D). |
 | `current_source{}` | `min`/`max` or `center`/`size`, `polarization`, `softness={sx,sy,sz}` | Generic impressed current density with a soft-edged box footprint. The building block behind all the others. |
+| `emitter{}` | `position`, `polarization` (`"rhcp"`, `"lhcp"` or a direction vector for linear), `toward` (default: grid centre), `amplitude`, `name`, plus the waveform keys | An ideal transmitter at a point, such as a GPS satellite or a jammer. Circular polarization uses two crossed point dipoles perpendicular to the line toward `toward`, 90° apart in phase, so the wave arriving there has that handedness (IEEE: RHCP rotates clockwise seen from behind, looking along the propagation direction). Used by `crpa{}`. |
 
 **Antenna keys** (`dipole` with a length, `monopole`, `loop`, `array`): `model` (`"thin"` default, `"rod"`, `"current"`), `radius` (thin wires, cells, default λ/400), `feed` (`"voltage"` default, `"current"`), `impedance` (Ω, default 50), `material` (rods). See below.
 
@@ -319,9 +321,82 @@ Things to know:
 - **Thin wires are invisible in the volume render** (they're thinner than a cell). The overlay draws them as bright lines.
 - **Straight wires only.** Thin wires run along x, y or z. Slanted conductors (such as drooping radials) can be staircased from metal cells with `shape{}`, which is approximate.
 - **Far field with grounds.** A ground plate must fit *inside* the far-field box, so a truly infinite plane (one reaching into the absorbing layer) can't be combined with `far_field{}`. Finite plates show the real-world behavior anyway.
-- **Not modelled:** feed lines, baluns and matching networks (the port shows the bare antenna impedance), and wire losses (wires are perfect conductors).
+- **Feed lines.** A feed port shows the bare antenna impedance, as if a matched line ran straight to the gap. To model the line itself, and a balun, use `coax{}` (below). Matching networks and wire losses (wires are perfect conductors) aren't modelled.
 
 `12_monopole_ground.lua` compares ground planes and counterpoises; `13_antenna_matching.lua` shows what a mismatch costs; `validation/dipole_impedance.lua` reproduces the table above.
+
+### Coaxial cables and baluns: `coax{}`
+
+`coax{}` builds a real coaxial cable on the grid. It has a square metal shield, a dielectric and a 1 × 1-cell centre conductor, with a generator at one end and a termination at the other. It also measures the waves travelling on the cable.
+
+```lua
+local cable = coax { from = vec(32, 70.5, 102.5), axis = "+x", length = 192, z0 = 50,
+                     termination = "terminals", terminals = "+z", balun = true, frequency = 300e6 }
+wire { from = cable.inner_terminal, to = cable.inner_terminal + vec(0, 0, 22) }   -- dipole arms
+wire { from = cable.outer_terminal, to = cable.outer_terminal - vec(0, 0, 22) }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `from` | required | Centre of the generator end. The cable's axis runs through the centre of the cell containing it. |
+| `axis` | `"+x"` | Direction from the generator to the far end (along x, y or z). |
+| `length` | 4λ | Length of the dielectric-filled line, in cells. |
+| `outer`, `wall` | 5, 1 | Inside width of the shield and its wall thickness, in cells. `outer` must be odd: the centre conductor is 1 cell wide. |
+| `z0` | 50 | Characteristic impedance. The dielectric's ε_r is chosen to give it (see below). With `outer = 5`, 50 Ω needs ε_r 2.46 and 75 Ω needs ε_r 1.10; `outer = 7` gives a 99 Ω air line. |
+| `material` | none | Explicit dielectric instead of `z0`. Then Z0 follows from it. |
+| `termination` | `"load"` | `"load"`: a resistor `load` (default Z0) across the last cell, against an end plate. `"open"`: the centre conductor stops 2 cells short of the end plate. `"short"`: it touches the plate. `"terminals"`: the end is open and an antenna is connected (below). |
+| `terminals` | `"+z"` | `"terminals"` only. The side the centre-conductor terminal faces. |
+| `balun` | `false` | Adds a quarter-wave sleeve balun at the far end (below). |
+| `balun_length`, `balun_gap` | λ/4, 2 | Sleeve length and its clearance round the shield, in cells. |
+| `amplitude`, `impedance` | 1, Z0 | The generator's EMF and internal resistance. Plus the waveform keys (`frequency`, `waveform = "pulse"`, …). |
+| `name` | `"cable"` | Port and monitor name. |
+
+It returns a table:
+- `z0`, `z0_air`: the line's impedance, and what it would be air-filled;
+- `epsilon_r` and `velocity_factor`;
+- `wavelength`: the wavelength in the cable, in cells;
+- `far_end`: the centre of the far end;
+- with `"terminals"`, `inner_terminal` and `outer_terminal`: the lattice nodes to connect an antenna to.
+
+**How it's built:**
+- **Conductors.** All conductors are perfect: their edges get the maximum edge conductivity. Ordinary `"metal"` would make a 1-cell centre conductor resistive over a long cable.
+- **Characteristic impedance.** Z0 comes from a 2-D electrostatic solve of the cross-section on the lattice: Z0 = η₀ / (√ε_r · G), where G is the lattice's capacitance per unit length in units of ε. That is exactly the impedance of the grid's TEM mode, so the measured Z0 matches the design value.
+- **Generator.** The existing rod feed: an EMF behind its internal resistance, across the 1-cell gap between the end plate and the centre conductor. The generator is also a port, so the Instruments window shows the impedance at the cable's input. That is the antenna's impedance transformed by the cable.
+- **Antenna terminals.** The centre conductor runs 3 cells past the shield. A strap continues the shield wall on the other side. Thin-wire arms joined to the two terminal nodes make a coax-fed dipole. The feed region between the terminals is 4 cells tall.
+- **Sleeve balun** ("bazooka"). A metal tube round the last `balun_length` cells of the cable, open at the antenna end and shorted to the shield at the other. With the outside of the shield, it forms a shorted quarter-wave stub. That presents a high impedance at the feed point to current flowing on the outside of the shield, and so chokes off the common-mode current.
+
+**The cable monitor** (the **Cable** window). At every cell along the line it takes three integrals of the fields, as complex amplitudes and as instantaneous values:
+- **V**: the voltage, ∫E·dl from the centre conductor to the shield, averaged over the 4 sides;
+- **I**: the line current, the loop integral of H around the centre conductor;
+- **I_cm**: the current on the outside of the cable, the loop integral of H around the whole shield. Where there is a sleeve, the loop goes round the sleeve instead.
+
+Inside a lossless line, V(t) = A e^(−jβt) + B e^(+jβt): a wave toward the far end and one coming back. Here t is the distance from the generator, and β is the lattice's own TEM propagation constant, sin(β/2) = √ε_r · sin(ω dt/2)/dt. A least-squares fit away from the ends gives A and B, and from them:
+- **Γ**: the reflection coefficient at the far end;
+- **return loss and VSWR**;
+- **Z at the far end**, Z0 (1 + Γ)/(1 − Γ): what the cable sees, including the feed region and anything coupling onto the shield;
+- **power**: the forward power as a share of the generator's available power, and the share of it delivered;
+- **shield current**: the peak outer current relative to the forward line current;
+- **check values**: Z0 = V+/I+ measured from the fit of I, and the fit residual.
+
+The window plots, along the cable:
+- the voltage envelope |V| and the live voltage, normalized to the forward wave. A traveling wave slides under a flat envelope; a standing wave pulses between fixed nodes half a wavelength apart.
+- the current on the outside of the shield.
+
+With `waveform = "pulse"`, the plots show the pulse travelling down the cable and back; add `sweep{}` for S11 at the generator.
+
+To see the fields inside the cable, lower `view{ metal_opacity = ... }`.
+
+**Measured accuracy** (48 cells/λ, 150-cell line):
+
+| Termination | Measured | Theory |
+|---|---|---|
+| Z0 from the waves (50 Ω design) | 50.0 Ω | 50.0 Ω |
+| Short | Γ = 1.000 ∠ 180° | 1 ∠ 180° |
+| Open (2-cell capped gap) | \|Γ\| = 0.999, Z = j311 Ω (the gap's capacitance) | \|Γ\| = 1 |
+| 50 Ω load | Γ = 0.057, return loss 25 dB (31 dB at 96 cells/λ) | 0 |
+| 100 Ω load | Γ = 0.338, Z = 94 − j22 Ω | 0.333, 100 Ω |
+
+The lumped load has a little series reactance from its current spreading over the end plate. `validation/coax_line.lua` reproduces the table; `18_coax_dipole.lua` feeds a dipole through 2λ of cable, with and without the balun.
 
 ### Frequency sweeps: `sweep{}`
 
@@ -376,7 +451,7 @@ Cut angles:
 - **xz**: from +x toward +z.
 - **yz**: from +y toward +z.
 
-D_max is searched over the three cuts plus two **beam maps**: 81 × 81 grids in direction cosines for the hemisphere around `axis` and the one behind it (about 2° near the axis). The maps are drawn as seen from behind the antenna looking out along `axis`: u is the direction's component to the right, v its component up (up is +z, or +y for an axis along z). For `"+x"`, u is along −y and v along +z; for `"+z"`, u is along −x and v along +y. The **Radiation pattern** window shows them as heatmaps with rings at 30°, 60° and 90° from the axis, so a beam steered in any direction is visible, not only one in a principal plane. The Cuts tab plots the three principal planes in dBi.
+D_max is searched over the three cuts plus two **beam maps**: 81 × 81 grids in direction cosines for the hemisphere around `axis` and the one behind it (about 2° near the axis). A horizontal antenna's maps are drawn as seen from behind it, looking out along `axis`: u is the direction's component to the right, v its component up (+z); for `"+x"`, u is along −y and v along +z. An antenna facing along z is drawn as seen from above, like a map or a GPS sky plot: u along +x (east), v along +y (north). The **Radiation pattern** window shows them as heatmaps with rings at 30°, 60° and 90° from the axis, so a beam steered in any direction is visible, not only one in a principal plane. The Cuts tab plots the three principal planes in dBi.
 
 **Arrays.** When the ports form a regular rectangular lattice (a phased array), the **Array elements** window shows each element's active VSWR, S11, accepted power, R or X as a map laid out like the array. In an array, an element's impedance depends on how its neighbours are driven (mutual coupling), so it changes with steering: this is the active, or scan, impedance. `15_patch_array.lua` shows it.
 
@@ -397,7 +472,7 @@ radar    { range = {40, 200}, fov = 35, noise = -45, log = "detections.csv" }
 | Key | Default | Meaning |
 |---|---|---|
 | `range = {min, max}` | 1 λ to the absorber | Image range in cells from the transmit centre. |
-| `fov` | 40 | Image half-angle in degrees, or `{azimuth, elevation}`. Boresight is the feeds' direction. Angles are as seen from behind the array looking out along it: elevation is positive up (+z; +y for an array facing along z), azimuth positive to the right. For a +x-facing array (scene 16) azimuth is toward −y and elevation toward +z. |
+| `fov` | 40 | Image half-angle in degrees, or `{azimuth, elevation}`. Boresight is the feeds' direction. For a horizontal array, angles are as seen from behind it looking out along it: elevation positive up (+z), azimuth positive to the right; for a +x-facing array (scene 16) azimuth is toward −y. An array facing along z is seen from above: azimuth toward +x, elevation toward +y. |
 | `noise` | none | Receiver noise: rms within the radar's band, in dB relative to the transmit pulse peak at a port (e.g. `-45`). |
 | `threshold` | 13 | Detection threshold in dB above the image floor (the median level). |
 | `dynamic_range` | 25 | Detections must lie within this many dB of the strongest return. |
@@ -439,6 +514,58 @@ Two spheres are resolved 30° apart and merge at 20°: the Hamming-tapered beam 
 
 ---
 
+### Adaptive antenna array (CRPA): `crpa{}`
+
+A controlled-reception-pattern antenna (CRPA) is an adaptive GPS array: it keeps the satellite and puts nulls on jammers. `crpa{}` turns dual-probe patch elements and `emitter{}` transmitters into one:
+
+```lua
+emitter { name = "GPS", position = satPos, polarization = "rhcp", toward = arrayCentre, frequency = f0 }
+emitter { name = "J1",  position = jamPos, polarization = vec(1, 0.3, 0.5), frequency = f0 }
+crpa    { satellite = "GPS", elements = { {x = "E1x", y = "E1y", center = vec(...)}, ... }, jnr = 40 }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `satellite` | required | Name of the satellite's `emitter{}`; every other emitter is a jammer. |
+| `elements` | required | Per element: the names of its two probe feeds (`x`, `y`, the two orthogonal patch modes) and its phase centre. |
+| `jnr` | 40 | Jammer-to-noise ratio (dB) of the strongest jammer at one element. All jammers transmit equal power, so the others are weaker by their actual coupling. |
+| `snr` | −20 | Satellite signal-to-noise ratio at one element. Real GPS arrives about 20 dB below the noise and is recovered by despreading. In `blind` mode it sets the satellite's transmit power from a free-space estimate, so the received level lands within a few dB of it; the window shows the actual value. |
+| `adapt` | `"blind"` | `"blind"`: the receiver estimates the covariance from snapshots of everything at once, as a real receiver does. `"ideal"`: each emitter is measured alone and the covariance is built as if from unlimited snapshots. See below. |
+| `steering` | `"model"` | Steering vector toward the satellite: `"model"` computes it from the satellite's known direction (plane-wave model of the array), `"measured"` uses its actual response (a perfectly calibrated array). |
+| `weights` | `"mvdr"` | `"mvdr"`, or `"steering"` for plain beam steering without nulling (for comparison). |
+| `periods` | 36 | Settling time in CW periods: `ideal`, per measurement pass; `blind`, before the snapshots start. |
+| `snapshot_periods` | 40 | `blind`: length of the snapshot window in carrier periods. The jammers' frequency offsets are multiples of 1 / this. |
+| `snapshot_rate` | 4 | `blind`: snapshots per carrier period. |
+| `noise_seed` | 1 | `blind`: seed of the receiver-noise realization. |
+| `north` | `{0,1,0}` | Compass reference: azimuths are measured clockwise from it (east = north × up). |
+| `log` | none | CSV with each emitter's direction and powers, and the weights. |
+
+Each patch has two probes, X and Y, which excite its two orthogonal modes. A 90° hybrid combines them into one right-hand-circular channel, (X − jY)/√2. The "cross-pol" column shows each emitter's left-hand response, (X + jY)/√2, relative to it. Linearly polarized jammers lose up to 3 dB.
+
+**Blind adaptation** (`adapt = "blind"`, the default) uses only what a real receiver has:
+1. **Listening.** Every emitter transmits at once. The jammers transmit a few percent off the carrier (+1, −1, +2, … × 1/`snapshot_periods`, shown next to their names). This makes them exactly uncorrelated over the snapshot window, as independent noise jammers are statistically. The run is `periods` + `snapshot_periods` + 4 periods long, and the feeds are 50 Ω loads.
+2. **Downconversion.** After `periods` of settling, the receiver mixes each port voltage with the carrier, x(t) = 2·LPF{v(t)·e^(−jω₀t)}. This is I/Q demodulation to complex baseband: x is the slowly varying amplitude and phase of the signal around the carrier. The low-pass filter is a 4-period Blackman–Harris window, which removes the 2ω₀ mixing product. The receiver samples x `snapshot_rate` times per period and forms the RHCP channels.
+3. **Covariance estimate.** Each snapshot gets the receiver's own thermal noise: complex Gaussian samples, independent per channel and per snapshot. Their level is set so the strongest jammer is at `jnr`. The weights use R̂ = (1/K) Σ x x^H over the K snapshots: MVDR w = R̂⁻¹a / (aᴴR̂⁻¹a), with a the steering vector toward the satellite's known direction. N elements can null up to N − 1 jammers.
+4. **Scoring.** A least-squares fit of the same recording at each emitter's own frequency separates the emitters' contributions. The table, the SINRs and `steering = "measured"` use this split; the weights never see it. The "separation residual" is what is left of the recording after the fit (mostly antennas still ringing from turn-on), relative to the weakest emitter.
+
+**Ideal adaptation** (`adapt = "ideal"`) measures each emitter in a pass of its own, with only that emitter transmitting. The steady-state port voltages are a least-squares fit over the last 4 periods of each pass. The covariance R = Σ jammers + satellite + noise is then built from these responses: the limit a receiver reaches with unlimited snapshots of independent signals. A real receiver can't do this. Use it to see the best case.
+
+Both modes then run an **adapted pass**: the emitters fall silent and the array transmits with its receive weights. By reciprocity the fields, and the far-field monitor, show the adapted receive pattern. That pass is at the carrier. In blind mode the jammers are off the carrier, so their nulls in the field view are shallower than at the jammers' own frequencies, where the table measures them. A narrowband null has a bandwidth, which is why wideband jammers need space-time adaptive processing.
+
+The **CRPA** window shows:
+- the adaptation mode and, for blind mode, the number of snapshots;
+- each emitter's compass direction, power at an element, power after the weights and after plain steering, and cross-polarization;
+- the SINR at the satellite for one element, steering only, and MVDR;
+- the separation residual (blind) or how well the measurements settled (ideal);
+- the weights;
+- a sky plot of the pattern predicted by the processor's array model (zenith in the centre, north up, east right).
+
+Changing `steering`, `weights` or `noise_seed` re-uses the recording and only recomputes and re-transmits. So does `jnr` or `snr` in ideal mode; in blind mode they are transmit powers, so the run repeats.
+
+**Measured accuracy** (`17_crpa_gps.lua`, 2 jammers at 40 dB).
+- **Ideal mode.** Responses settle to −79…−91 dB at 36 periods per pass. MVDR leaves the jammers 40–53 dB below the noise and lifts the satellite's SINR from −61 dB (one element) to −18 dB. Probes at the jammers in the adapted pass confirm the transmitted nulls: 47–59 dB deep along each jammer's polarization relative to plain steering. A probe point can't confirm deeper nulls, because the null holds for the field averaged over the jammer's source footprint, which is what the jammer couples to.
+- **Blind mode.** One 80-period run (instead of 3 × 36) and K = 160 snapshots give the same SINR improvement, about 43 dB. The jammers end up 21–24 dB below the noise; with 3 jammers, all are 20–26 dB below. Nulls are shallower than in ideal mode: this is the sample-matrix-inversion limit. MVDR only has to push a jammer under the noise, and with K snapshots the residual lands about 10·log₁₀K dB below it. A real receiver collects thousands of snapshots per millisecond.
+
 ## 9. Accuracy guidelines
 
 - **Resolution.** Use at least 12–16 cells per wavelength in the *densest* material: λ_material = λ / √ε_r. The app warns below 8. Numerical dispersion makes waves slightly slow; the error falls with the square of the resolution.
@@ -456,7 +583,7 @@ Two spheres are resolved 30° apart and merge at 20°: the Hamming-tapered beam 
 - Non-magnetic materials only (μ_r = 1), and no frequency dispersion.
 - Materials are isotropic and constant within each cell.
 - Thin wires must run along x, y or z, at least a couple of cells from other conductors (except where they join). Wires are perfect conductors (no ohmic loss).
-- Antenna feeds are lumped sources in a one-cell gap. Feed lines, baluns and matching networks aren't modelled. Impedance is evaluated at one frequency per run with CW, or across a band with a pulsed `sweep{}`.
+- Antenna feeds are lumped sources in a one-cell gap. Feed lines and sleeve baluns can be modelled with `coax{}`; its cables are square, at least 7 cells across (so electrically thicker than real coax unless the grid is fine), with a 1-cell centre conductor. Matching networks aren't modelled. Impedance is evaluated at one frequency per run with CW, or across a band with a pulsed `sweep{}`.
 - Metal sheets (`sheet{}`) are perfect conductors lying in lattice planes.
 - The radar processes one transmitted pulse per measurement (no Doppler, no moving targets). Its range resolution is set by the antennas' bandwidth.
 - One far-field monitor per scene, at a single frequency.

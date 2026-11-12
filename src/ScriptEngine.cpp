@@ -652,7 +652,7 @@ int api_scene(lua_State* L) {
 
 int api_view(lua_State* L) {
     Args a(L, "view", {"mode", "component", "gain", "gain_e", "gain_b", "exposure", "density", "step",
-                       "steps_per_frame", "distance", "yaw", "pitch", "target", "overlay"});
+                       "steps_per_frame", "distance", "yaw", "pitch", "target", "overlay", "metal_opacity"});
     ViewHints& v = ctx().view;
     if (auto m = a.optStr("mode")) {
         static const std::vector<std::string> modes = {"fields", "e", "b", "poynting", "signed"};
@@ -669,6 +669,7 @@ int api_view(lua_State* L) {
     if (auto x = a.optNum("exposure")) v.exposure = static_cast<float>(*x);
     if (auto x = a.optNum("density")) v.density = static_cast<float>(*x);
     if (auto x = a.optNum("step")) v.stepVoxels = static_cast<float>(*x);
+    if (auto x = a.optNum("metal_opacity")) v.metalOpacity = std::clamp(static_cast<float>(*x), 0.0f, 1.0f);
     if (a.has("steps_per_frame")) v.stepsPerFrame = std::clamp(a.integer("steps_per_frame", 2), 1, 64);
     v.cameraDistance = static_cast<float>(a.num("distance", v.cameraDistance));
     v.cameraYawDeg = static_cast<float>(a.num("yaw", v.cameraYawDeg));
@@ -1234,6 +1235,7 @@ void addFeed(lua_State* L, const SourceDesc& wave, const glm::ivec3& texel, int 
     } else {
         s.amplitude = feed.drive / static_cast<float>(edges);
     }
+    s.port = static_cast<int>(env.ports.size()); // the port pushed below
     addSource(L, s);
 
     PortSetup p;
@@ -1841,7 +1843,314 @@ int api_radar(lua_State* L) {
     return 0;
 }
 
+// A transmitter at a point: ideal dipole(s), linearly or circularly polarized. Circular
+// polarization uses two crossed dipoles perpendicular to the line toward `toward` (default: the
+// grid centre), 90 degrees apart in phase, so the wave arriving there has that handedness (IEEE:
+// RHCP rotates clockwise seen from behind, looking along the propagation direction).
+int api_emitter(lua_State* L) {
+    Args a(L, "emitter", {"position", "name", "polarization", "toward", "amplitude", WAVEFORM_KEYS});
+    lock(L);
+    SourceDesc w;
+    readWaveform(a, w);
+    Environment& env = builder(L).env();
+    EmitterSetup e;
+    e.position = a.reqVec("position");
+    e.name = a.str("name", fmt("emitter %zu", env.emitters.size() + 1));
+    for (const EmitterSetup& o : env.emitters)
+        if (o.name == e.name) a.fail("an emitter named '%s' already exists", e.name.c_str());
+    const int index = static_cast<int>(env.emitters.size());
+    const float amp = static_cast<float>(a.num("amplitude", 1.0));
+    auto add = [&](const glm::vec3& dir, float extraPhase) {
+        SourceDesc s = SourceDesc::dipole(e.position, dir, w.wavelength, amp, 0.0f);
+        copyTiming(s, w);
+        s.phase += extraPhase;
+        s.emitter = index;
+        addSource(L, s);
+    };
+    std::string pol = "linear";
+    if (a.push("polarization") == LUA_TSTRING) pol = lower(lua_tostring(L, -1));
+    lua_pop(L, 1);
+    if (pol == "rhcp" || pol == "lhcp") {
+        const glm::vec3 toward = a.vec("toward", glm::vec3(ctx().settings.size) * 0.5f);
+        const glm::vec3 d = glm::normalize(toward - e.position); // propagation direction
+        const glm::vec3 ref = std::abs(d.z) < 0.9f ? glm::vec3(0, 0, 1) : glm::vec3(1, 0, 0);
+        const glm::vec3 ea = glm::normalize(glm::cross(d, ref));
+        const glm::vec3 eb = glm::cross(d, ea); // (ea, eb, d) right-handed
+        // E ~ ea cos(wt) + eb sin(wt) is right-hand circular for propagation along d (s(t) = sin(wt + phase)).
+        add(ea, glm::half_pi<float>());
+        add(eb, pol == "rhcp" ? 0.0f : glm::pi<float>());
+    } else {
+        const auto dir = a.optDirection("polarization");
+        if (!dir) a.fail("polarization must be \"rhcp\", \"lhcp\" or a direction vector (linear)");
+        add(*dir, 0.0f);
+        pol = "linear";
+    }
+    e.polarization = pol;
+    env.emitters.push_back(e);
+    a.checkUnknown();
+    return 0;
+}
+
+// Adaptive GPS antenna array (CRPA) processor over dual-probe RHCP elements.
+int api_crpa(lua_State* L) {
+    Args a(L, "crpa", {"satellite", "elements", "jnr", "snr", "steering", "weights", "periods", "north", "log", "name",
+                           "adapt", "snapshot_periods", "snapshot_rate", "noise_seed"});
+    lock(L);
+    CrpaSetup c;
+    c.satellite = a.str("satellite", "");
+    if (c.satellite.empty()) a.fail("needs satellite = <emitter name>");
+    if (a.push("elements") != LUA_TTABLE) {
+        lua_pop(L, 1);
+        a.fail("needs elements = { {x = \"port\", y = \"port\", center = vec(...)}, ... }");
+    }
+    const lua_Integer n = static_cast<lua_Integer>(lua_rawlen(L, -1));
+    for (lua_Integer i = 1; i <= n; ++i) {
+        lua_rawgeti(L, -1, i);
+        if (lua_type(L, -1) != LUA_TTABLE) {
+            lua_pop(L, 2);
+            a.fail("elements[%d] must be a table {x = ..., y = ..., center = ...}", static_cast<int>(i));
+        }
+        CrpaElement el;
+        lua_getfield(L, -1, "x");
+        if (lua_type(L, -1) == LUA_TSTRING) el.portX = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "y");
+        if (lua_type(L, -1) == LUA_TSTRING) el.portY = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "center");
+        if (lua_type(L, -1) == LUA_TTABLE) {
+            for (int k = 0; k < 3; ++k) {
+                lua_rawgeti(L, -1, k + 1);
+                el.center[k] = static_cast<float>(lua_tonumber(L, -1));
+                lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 2);
+        if (el.portX.empty() || el.portY.empty()) {
+            lua_pop(L, 1);
+            a.fail("elements[%d] needs x and y port names", static_cast<int>(i));
+        }
+        c.elements.push_back(el);
+    }
+    lua_pop(L, 1);
+    if (c.elements.size() < 2) a.fail("a CRPA needs at least 2 elements");
+    c.jnrDb = static_cast<float>(a.num("jnr", 40.0));
+    c.snrDb = static_cast<float>(a.num("snr", -20.0));
+    const std::string steering = lower(a.str("steering", "model"));
+    if (steering != "model" && steering != "measured") a.fail("steering must be \"model\" or \"measured\"");
+    c.measuredSteering = steering == "measured";
+    const std::string weights = lower(a.str("weights", "mvdr"));
+    if (weights != "mvdr" && weights != "steering") a.fail("weights must be \"mvdr\" or \"steering\"");
+    c.mvdr = weights == "mvdr";
+    c.passPeriods = static_cast<float>(a.positive("periods", 36.0));
+    const std::string adapt = lower(a.str("adapt", "blind"));
+    if (adapt != "blind" && adapt != "ideal") a.fail("adapt must be \"blind\" or \"ideal\"");
+    c.blind = adapt == "blind";
+    c.snapshotPeriods = static_cast<float>(std::round(a.positive("snapshot_periods", 40.0)));
+    if (c.snapshotPeriods < 8.0f) a.fail("snapshot_periods must be at least 8");
+    c.snapshotsPerPeriod = std::clamp(static_cast<int>(std::lround(a.positive("snapshot_rate", 4.0))), 1, 16);
+    c.noiseSeed = static_cast<unsigned>(std::max(0.0, a.num("noise_seed", 1.0)));
+    if (auto nv = a.optVec("north")) c.north = glm::normalize(*nv);
+    c.logPath = a.str("log", "");
+    builder(L).env().crpa = c;
+    a.checkUnknown();
+    return 0;
+}
+
 // warning("text"): a message shown with the scene's warnings (Scene panel and console).
+// Coaxial cable: square shield, dielectric and a 1x1-cell inner conductor, a generator at
+// `from`, a termination at the far end, an optional quarter-wave sleeve balun, and a
+// transmission-line monitor. Returns a table with the line's properties and terminal nodes.
+int api_coax(lua_State* L) {
+    Args a(L, "coax", {"from", "axis", "length", "inner", "outer", "wall", "z0", "material", "termination", "load",
+                       "terminals", "balun", "balun_length", "balun_gap", "amplitude", "impedance", "name",
+                       WAVEFORM_KEYS});
+    lock(L);
+    SourceDesc wave;
+    readWaveform(a, wave);
+    const glm::vec3 from = a.reqVec("from");
+    const glm::vec3 dir = a.optDirection("axis").value_or(glm::vec3(1, 0, 0));
+    const int ax = wireAxis(a, dir), u = (ax + 1) % 3, v = (ax + 2) % 3;
+    const int s = dir[ax] >= 0.0f ? 1 : -1;
+    const int len = static_cast<int>(std::lround(a.positive("length", 4.0 * wave.wavelength)));
+    const int inner = static_cast<int>(std::lround(a.num("inner", 1.0)));
+    const int outer = static_cast<int>(std::lround(a.num("outer", 5.0)));
+    const int wall = static_cast<int>(std::lround(a.num("wall", 1.0)));
+    if (inner != 1) a.fail("inner must be 1 cell (the generator drives the inner conductor across a 1x1-cell gap)");
+    if (outer < 3 || outer % 2 == 0) a.fail("outer (the inside of the shield, cells) must be odd and >= 3");
+    if (wall < 1) a.fail("wall must be >= 1 cell");
+    const std::string term = lower(a.str("termination", "load"));
+    if (term != "load" && term != "open" && term != "short" && term != "terminals")
+        a.fail("termination must be \"load\", \"open\", \"short\" or \"terminals\" (connect an antenna)");
+    if (len < 2 * outer + 12) a.fail("length must be at least %d cells for this cross-section", 2 * outer + 12);
+    const std::string name = a.str("name", "cable");
+
+    // Characteristic impedance from a 2-D electrostatic solve of the cross-section on the lattice.
+    const double g = CoaxMonitor::geometryFactor(inner, outer);
+    const double z0Air = kEta0 / g;
+    Material diel = Material::dielectric(1.0f);
+    std::string dielName = name + " dielectric";
+    if (a.has("material")) {
+        diel = readMaterial(a, "vacuum");
+    } else {
+        const double target = a.positive("z0", 50.0);
+        double er = (z0Air / target) * (z0Air / target);
+        if (er < 1.0) {
+            warn(L, fmt("coax: %.1f ohm needs a wider shield; with outer = %d the air-filled line is %.1f ohm",
+                        target, outer, z0Air));
+            er = 1.0;
+        }
+        diel = Material::dielectric(static_cast<float>(er));
+        if (er > 1.0) {
+            float& e = ctx().usedDielectrics[dielName];
+            e = std::max(e, diel.epsilonR);
+        }
+    }
+    const double z0 = z0Air / std::sqrt(std::max(diel.epsilonR, 1.0f));
+
+    // Terminal side ("terminals"): the inner conductor rises toward it, a strap continues the
+    // shield on the opposite side.
+    const glm::vec3 tdir = a.optDirection("terminals").value_or(ax == 2 ? glm::vec3(0, 1, 0) : glm::vec3(0, 0, 1));
+    const int tax = wireAxis(a, tdir);
+    if (tax == ax) a.fail("terminals must be perpendicular to the cable axis");
+    const int ts = tdir[tax] >= 0.0f ? 1 : -1;
+
+    // Geometry helpers: t = distance from the generator along the cable; transverse ranges are
+    // centred on the cell centre through `from`.
+    const int start = static_cast<int>(std::lround(from[ax]));
+    glm::vec3 centre;
+    centre[ax] = static_cast<float>(start);
+    centre[u] = std::floor(from[u]) + 0.5f;
+    centre[v] = std::floor(from[v]) + 0.5f;
+    auto put = [&](int t0, int t1, int size, const Material& m) {
+        glm::vec3 lo, hi;
+        lo[ax] = static_cast<float>(s > 0 ? start + t0 : start - t1);
+        hi[ax] = static_cast<float>(s > 0 ? start + t1 : start - t0);
+        for (int k : {u, v}) {
+            lo[k] = centre[k] - 0.5f * static_cast<float>(size);
+            hi[k] = centre[k] + 0.5f * static_cast<float>(size);
+        }
+        builder(L).box(lo, hi, m);
+    };
+    // Perfect conductors: even an edge with one metal cell of four (the corners of the 1x1-cell inner
+    // conductor) gets the maximum edge conductivity. Ordinary "metal" would make the thin inner
+    // conductor resistive over a long cable.
+    const Material metal = Material::metal(4.0f * kPerfectEdgeSigma);
+    const int shield = outer + 2 * wall;
+    const bool capped = term != "terminals";
+
+    CoaxSetup c;
+    c.name = name;
+    c.axis = ax;
+    c.sign = s;
+    c.start = start;
+    c.center = centre;
+    c.length = len;
+    c.inner = inner;
+    c.outer = outer;
+    c.wall = wall;
+    c.epsilonR = diel.epsilonR;
+    c.z0Ohm = static_cast<float>(z0);
+    c.wavelength = wave.wavelength;
+    c.cellSize = builder(L).env().cellSize;
+    c.termination = term;
+    c.pulsed = wave.waveform == Waveform::GaussianPulse;
+
+    // Quarter-wave sleeve ("bazooka") balun: a tube round the shield, shorted to it at the end
+    // away from the antenna and open at the antenna end. The quarter-wave shorted stub it forms
+    // with the shield presents a high impedance to current on the outside of the shield.
+    if (a.boolean("balun", false)) {
+        const int bl = static_cast<int>(std::lround(a.positive("balun_length", 0.25 * wave.wavelength)));
+        const int gap = static_cast<int>(std::lround(a.positive("balun_gap", 2.0)));
+        const int sleeve = shield + 2 * (gap + wall);
+        if (bl + wall >= len - 4) a.fail("balun_length is too long for this cable");
+        put(len - bl - wall, len, sleeve, metal);
+        put(len - bl, len, shield + 2 * gap, Material::vacuum());
+        c.sleeveStart = len - bl - wall;
+        c.sleeveEnd = len;
+        c.sleeveOuter = sleeve;
+    }
+    put(-wall, capped ? len + wall : len, shield, metal); // shield, with end plates
+    put(0, len, outer, diel);
+    const int innerEnd = term == "terminals" ? len + 3 : term == "short" ? len : term == "load" ? len - 1 : len - 2;
+    put(1, innerEnd, inner, metal);
+
+    // Generator: EMF behind its internal resistance across the 1-cell gap between the end
+    // plate and the inner conductor (the four corner edges of the gap cell).
+    FeedSpec gen;
+    gen.voltage = true;
+    gen.impedanceOhm = static_cast<float>(a.positive("impedance", z0));
+    gen.drive = static_cast<float>(a.num("amplitude", 1.0));
+    glm::ivec3 gapCell;
+    gapCell[ax] = s > 0 ? start : start - 1;
+    gapCell[u] = static_cast<int>(std::floor(centre[u]));
+    gapCell[v] = static_cast<int>(std::floor(centre[v]));
+    addFeed(L, wave, gapCell, ax, static_cast<float>(s), 4, gen, name);
+    c.sourceOhm = gen.impedanceOhm;
+    c.drive = gen.drive;
+
+    // Matched (or any) load: a resistor across the last cell, against the far end plate.
+    c.loadOhm = static_cast<float>(a.positive("load", z0));
+    if (term == "load") {
+        FeedSpec load;
+        load.voltage = true;
+        load.impedanceOhm = c.loadOhm;
+        load.drive = 0.0f;
+        glm::ivec3 cell = gapCell;
+        cell[ax] = s > 0 ? start + len - 1 : start - len;
+        SourceDesc quiet = wave;
+        quiet.enabled = true;
+        addFeed(L, quiet, cell, ax, static_cast<float>(-s), 4, load, name + " load");
+    } else if (a.has("load")) {
+        warn(L, "coax: 'load' only applies to termination = \"load\"");
+    }
+
+    // Antenna terminals: the inner conductor runs 3 cells past the shield; a strap continues
+    // the shield wall on the far side. Thin-wire arms attach to the returned nodes.
+    glm::vec3 innerNode(0.0f), outerNode(0.0f);
+    if (term == "terminals") {
+        const int tu = tax == u ? v : u; // the other transverse axis
+        glm::vec3 lo, hi;
+        lo[ax] = static_cast<float>(s > 0 ? start + len : start - len - 3);
+        hi[ax] = static_cast<float>(s > 0 ? start + len + 3 : start - len);
+        lo[tu] = centre[tu] - 0.5f;
+        hi[tu] = centre[tu] + 0.5f;
+        const float wallIn = 0.5f * static_cast<float>(outer), wallOut = wallIn + static_cast<float>(wall);
+        lo[tax] = ts > 0 ? centre[tax] - wallOut : centre[tax] + wallIn;
+        hi[tax] = ts > 0 ? centre[tax] - wallIn : centre[tax] + wallOut;
+        builder(L).box(lo, hi, metal);
+        innerNode[ax] = outerNode[ax] = static_cast<float>(start + s * (len + 2));
+        innerNode[tu] = outerNode[tu] = centre[tu] - 0.5f;
+        innerNode[tax] = centre[tax] + 0.5f * static_cast<float>(ts);
+        outerNode[tax] = centre[tax] - static_cast<float>(ts) * wallOut;
+    }
+    builder(L).env().coaxes.push_back(c);
+    a.checkUnknown();
+
+    lua_newtable(L);
+    lua_pushnumber(L, z0);
+    lua_setfield(L, -2, "z0");
+    lua_pushnumber(L, z0Air);
+    lua_setfield(L, -2, "z0_air");
+    lua_pushnumber(L, diel.epsilonR);
+    lua_setfield(L, -2, "epsilon_r");
+    lua_pushnumber(L, 1.0 / std::sqrt(std::max(diel.epsilonR, 1.0f)));
+    lua_setfield(L, -2, "velocity_factor");
+    lua_pushnumber(L, wave.wavelength / std::sqrt(std::max(diel.epsilonR, 1.0f)));
+    lua_setfield(L, -2, "wavelength");
+    glm::vec3 endCentre = centre;
+    endCentre[ax] = static_cast<float>(start + s * len);
+    pushVec(L, endCentre);
+    lua_setfield(L, -2, "far_end");
+    if (term == "terminals") {
+        pushVec(L, innerNode);
+        lua_setfield(L, -2, "inner_terminal");
+        pushVec(L, outerNode);
+        lua_setfield(L, -2, "outer_terminal");
+    }
+    return 1;
+}
+
 int api_warning(lua_State* L) {
     const char* msg = luaL_checkstring(L, 1);
     warn(L, msg);
@@ -1990,6 +2299,8 @@ void registerApi(lua_State* L) {
         {"probe", wrap<api_probe>},         {"flux_plane", wrap<api_flux_plane>},
         {"flux_box", wrap<api_flux_box>},   {"far_field", wrap<api_far_field>},
         {"radar", wrap<api_radar>},         {"warning", wrap<api_warning>},
+        {"emitter", wrap<api_emitter>},     {"crpa", wrap<api_crpa>},
+        {"coax", wrap<api_coax>},
     };
     for (const luaL_Reg& r : api) lua_register(L, r.name, r.func);
 
@@ -2154,6 +2465,22 @@ void finalChecks(Context& c) {
     for (const SourceDesc& s : env.sources)
         if (glm::length(s.halfExtent) < 1e3f && inAbsorber(s.center))
             c.warnings.push_back("a source lies inside the absorbing boundary layer (it will be damped)");
+    if (env.crpa) {
+        const CrpaSetup& cr = *env.crpa;
+        bool found = false;
+        for (const EmitterSetup& e : env.emitters) found = found || e.name == cr.satellite;
+        if (!found) throw ScriptError("crpa: no emitter named '" + cr.satellite + "' (the satellite)");
+        for (const CrpaElement& el : cr.elements)
+            for (const std::string& name : {el.portX, el.portY}) {
+                bool port = false;
+                for (const PortSetup& p : env.ports) port = port || p.name == name;
+                if (!port) throw ScriptError("crpa: no antenna feed named '" + name + "'");
+            }
+        const size_t jammers = env.emitters.size() - 1;
+        if (jammers >= cr.elements.size())
+            c.warnings.push_back(fmt("crpa: %zu jammers but only %zu elements: an N-element array can null at most "
+                                     "N - 1 jammers", jammers, cr.elements.size()));
+    }
     if (env.sweep) {
         bool pulsed = false;
         for (const SourceDesc& s : env.sources) pulsed = pulsed || s.waveform == Waveform::GaussianPulse;

@@ -11,6 +11,8 @@
 #include "FarField.hpp"
 #include "FieldAnalyzer.hpp"
 #include "Ports.hpp"
+#include "Coax.hpp"
+#include "Crpa.hpp"
 #include "Radar.hpp"
 #include "SimulationGrid.hpp"
 
@@ -129,7 +131,7 @@ private:
 // Scene description
 // -----------------------------------------------------------------------------
 struct ViewHints {
-    std::optional<float> gainE, gainB, exposure, density, stepVoxels;
+    std::optional<float> gainE, gainB, exposure, density, stepVoxels, metalOpacity;
     std::optional<int> mode, signedAxis, stepsPerFrame;
     std::optional<bool> overlay;
     std::optional<glm::vec3> target;   // orbit pivot in lattice coordinates (default: grid centre)
@@ -178,6 +180,9 @@ struct Environment {
     std::vector<PortSetup> ports;    // antenna feeds: impedance, VSWR, accepted power
     std::optional<RadarSetup> radar; // pulsed radar receiver on the antenna ports
     std::vector<TargetInfo> targets; // objects marked target = true (removed for radar calibration)
+    std::vector<EmitterSetup> emitters; // emitter{} transmitters (GPS satellite, jammers)
+    std::optional<CrpaSetup> crpa;   // adaptive antenna array processor
+    std::vector<CoaxSetup> coaxes;   // coax{} cables: transmission-line monitor
     ViewHints view;
 };
 

@@ -22,11 +22,17 @@
 
 class SimulationGrid;
 
-// The view from behind an antenna looking out along its boresight n (an axis direction):
-// "up" is +z (or +y when n is along z) and "right" = n x up. Azimuth is positive to the right,
-// elevation positive up; beam maps and array maps are drawn this way.
+// The frame beam maps, array maps and radar angles use for an antenna with boresight n (an
+// axis direction). A horizontal antenna is seen from behind, looking out along n: "up" is +z
+// and "right" = n x up, so azimuth is positive to the right. An antenna facing up or down (along
+// z) is seen from above, like a map or a GPS sky plot: right = +x (east), up = +y (north).
 inline void boresightFrame(const glm::vec3& n, glm::vec3& right, glm::vec3& up) {
-    up = std::abs(n.z) > 0.5f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(0.0f, 0.0f, 1.0f);
+    if (std::abs(n.z) > 0.5f) {
+        right = glm::vec3(1.0f, 0.0f, 0.0f);
+        up = glm::vec3(0.0f, 1.0f, 0.0f);
+        return;
+    }
+    up = glm::vec3(0.0f, 0.0f, 1.0f);
     right = glm::cross(n, up);
 }
 

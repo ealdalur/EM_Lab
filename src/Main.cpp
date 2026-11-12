@@ -505,6 +505,7 @@ void Application::applyScene(ScriptResult&& result, bool newScene) {
     }
     if (!radar) m_radarCalibrated = false;
     grid.setSources(env.sources);
+    m_gpu->instruments.setSceneKept(keepFields);
     m_gpu->instruments.configure(grid, env, result.outputDir, result.warnings, radarStart);
     m_gpu->instruments.takeSnapshot(grid);
     m_warnings = result.warnings;
@@ -547,6 +548,7 @@ void Application::applyView(const Environment& env) {
     if (v.exposure) r.exposure = *v.exposure;
     if (v.density) r.density = *v.density;
     if (v.stepVoxels) r.stepVoxels = *v.stepVoxels;
+    if (v.metalOpacity) r.materialOpacity = *v.metalOpacity;
     if (v.overlay) r.showOverlay = *v.overlay;
     if (v.mode) r.mode = static_cast<RenderSettings::Mode>(std::clamp(*v.mode, 0, 4));
     if (v.signedAxis) {
@@ -574,6 +576,7 @@ void Application::applyViewChanges(const ViewHints& v) {
     if (v.exposure != o.exposure && v.exposure) m_render.exposure = *v.exposure;
     if (v.density != o.density && v.density) m_render.density = *v.density;
     if (v.stepVoxels != o.stepVoxels && v.stepVoxels) m_render.stepVoxels = *v.stepVoxels;
+    if (v.metalOpacity != o.metalOpacity && v.metalOpacity) m_render.materialOpacity = *v.metalOpacity;
     if (v.overlay != o.overlay && v.overlay) m_render.showOverlay = *v.overlay;
     if (v.mode != o.mode && v.mode) m_render.mode = static_cast<RenderSettings::Mode>(std::clamp(*v.mode, 0, 4));
     if (v.signedAxis != o.signedAxis && v.signedAxis) m_render.signedAxis = *v.signedAxis;
@@ -1059,6 +1062,9 @@ int Application::run() {
             m_hotReloadTimer = 0.0;
             checkHotReload();
         }
+
+        // ---- CRPA: switch the transmitting sources between its passes ---------
+        if (inst.hasCrpa()) inst.crpaUpdate(grid);
 
         // ---- simulate --------------------------------------------------------
         const int steps = m_paused ? (m_singleStep ? 1 : 0) : m_stepsPerFrame;
